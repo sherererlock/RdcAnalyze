@@ -43,7 +43,8 @@ from workers import (
 from computed import compute_analysis
 from render_graph import generate_render_graph_html
 from export_assets import (
-    collect_meshes, collect_textures,
+    collect_meshes, collect_textures, collect_draw_texture_ids,
+    filter_shader_disasm, _dedup_meshes,
     _collect_meshes_shard, _collect_textures_shard,
 )
 
@@ -69,7 +70,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--export-assets", action="store_true",
-        help="Export mesh OBJ and texture PNG files for each draw/resource",
+        help="Export mesh FBX and texture PNG files for each draw/resource",
     )
     args = parser.parse_args()
 
@@ -259,17 +260,35 @@ def main() -> None:
                             errors.append({"phase": "mesh_export", "error": str(exc)})
 
                 mesh_progress.done()
+                deduped = _dedup_meshes(all_meshes, out_dir / "meshes")
+                if deduped:
+                    print(f"    Deduplicated {deduped} meshes")
                 write_json(out_dir / "meshes.json", all_meshes)
                 timings["mesh_export"] = time.time() - t0
 
-                # Textures
+                significant_eids = {int(eid) for eid in all_meshes}
+
+                # Filter shaders to significant draws
+                filtered_shaders = filter_shader_disasm(shader_disasm, significant_eids)
+                write_json(out_dir / "exported_shaders.json", filtered_shaders)
+                print(f"    Shaders: {len(filtered_shaders)}/{len(shader_disasm)} pairs for significant draws")
+
+                # Texture IDs from significant draws
+                print(f"\n[Step 6.5b] Collecting texture IDs for {len(significant_eids)} significant draws ...")
+                t0 = time.time()
+                tex_ids = collect_draw_texture_ids(
+                    significant_eids, errors, session=MAIN_SESSION,
+                )
+                print(f"    Found {len(tex_ids)} bound textures")
+
+                # Export only bound textures
                 tex_tasks = [
                     (r["id"], r.get("name", ""))
                     for r in (_unwrap(summary.get("resources"), "resources") or [])
                     if isinstance(r, dict) and r.get("type") == "Texture"
+                    and r.get("id") in tex_ids
                 ]
-                print(f"\n[Step 6.5b] Exporting {len(tex_tasks)} textures ({len(active_workers)} workers) ...")
-                t0 = time.time()
+                print(f"\n[Step 6.5c] Exporting {len(tex_tasks)} textures ({len(active_workers)} workers) ...")
                 (out_dir / "textures").mkdir(exist_ok=True)
                 tex_shards = _shard_list(tex_tasks, len(active_workers))
                 tex_progress = Progress(len(tex_tasks), "Texture export")
@@ -323,13 +342,22 @@ def main() -> None:
             if args.export_assets:
                 print(f"\n[Step 6.5a] Exporting meshes for {len(draw_eids)} draws ...")
                 t0 = time.time()
-                meshes = collect_meshes(draw_eids, out_dir, errors)
+                meshes, significant_eids = collect_meshes(draw_eids, out_dir, errors)
                 write_json(out_dir / "meshes.json", meshes)
                 timings["mesh_export"] = time.time() - t0
 
-                print(f"\n[Step 6.5b] Exporting textures ...")
+                # Filter shaders to significant draws
+                filtered_shaders = filter_shader_disasm(shader_disasm, significant_eids)
+                write_json(out_dir / "exported_shaders.json", filtered_shaders)
+                print(f"    Shaders: {len(filtered_shaders)}/{len(shader_disasm)} pairs for significant draws")
+
+                print(f"\n[Step 6.5b] Collecting texture IDs for {len(significant_eids)} significant draws ...")
                 t0 = time.time()
-                textures = collect_textures(summary, out_dir, errors)
+                tex_ids = collect_draw_texture_ids(significant_eids, errors)
+                print(f"    Found {len(tex_ids)} bound textures")
+
+                print(f"\n[Step 6.5c] Exporting textures ...")
+                textures = collect_textures(summary, out_dir, errors, resource_ids=tex_ids)
                 write_json(out_dir / "textures.json", textures)
                 timings["texture_export"] = time.time() - t0
 
