@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(grep -E \"\\\\.\\(py|txt|md|json\\)$\")",
+      "Bash(git -C /e/workspace/GitRepository/renderdoc-EasyExportResources log --oneline -1)",
+      "Bash(git -C /e/workspace/GitRepository/renderdoc-EasyExportResources remote -v)",
+      "Bash(xargs grep *)",
+      "Bash(python/python.exe *)"
+    ]
+  }
+}

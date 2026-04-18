@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Render Graph</title>
+<link rel="stylesheet" href="__ASSETS__/rdc-common.css">
+<script src="__ASSETS__/d3.min.js"></script>
+<script src="__ASSETS__/dagre.min.js"></script>
+<style>
+body {
+  overflow: hidden;
+  height: 100vh;
+}
+
+body::before {
+  opacity: 0.6;
+}
+
+/* ── Top bar ── */
+#topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 48px;
+  background: rgba(13,16,23,0.85);
+  backdrop-filter: blur(16px) saturate(1.3);
+  -webkit-backdrop-filter: blur(16px) saturate(1.3);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  z-index: 50;
+  gap: 16px;
+}
+
+#topbar .logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#topbar .logo-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  background: linear-gradient(135deg, var(--accent-cyan), var(--compute-blue));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -0.5px;
+}
+
+#topbar .logo-text {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.5px;
+}
+
+#topbar .divider {
+  width: 1px;
+  height: 20px;
+  background: var(--border-mid);
+}
+
+#topbar .stat-group {
+  display: flex;
+  gap: 16px;
+}
+
+#topbar .stat {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+#topbar .stat .val {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+#topbar .controls {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.btn {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-mid);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  letter-spacing: 0.3px;
+  user-select: none;
+}
+
+.btn:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border-color: var(--border-bright);
+}
+
+.btn.active {
+  background: var(--accent-cyan-dim);
+  color: var(--accent-cyan);
+  border-color: rgba(0,212,255,0.3);
+}
+
+.btn-icon {
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
+/* ── Search ── */
+#search-wrap {
+  position: relative;
+}
+
+#search {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 5px 10px 5px 28px;
+  border-radius: 6px;
+  border: 1px solid var(--border-mid);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  width: 180px;
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+#search:focus {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 2px var(--accent-cyan-dim);
+  width: 240px;
+}
+
+#search::placeholder { color: var(--text-muted); }
+
+#search-icon {
+  position: absolute;
+  left: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+/* ── Canvas ── */
+svg#canvas {
+  width: 100vw;
+  height: calc(100vh - 48px);
+  margin-top: 48px;
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Node styles ── */
+.node { cursor: pointer; }
+
+.node .card {
+  transition: filter 0.2s ease;
+}
+
+.node:hover .card {
+  filter: brightness(1.15);
+}
+
+.node.dimmed { opacity: 0.15; transition: opacity 0.3s ease; }
+.node.highlighted { opacity: 1; transition: opacity 0.3s ease; }
+
+.node .card-bg {
+  rx: 8; ry: 8;
+  stroke-width: 1.5;
+}
+
+.node .card-header-line {
+  stroke-width: 1;
+  opacity: 0.25;
+}
+
+.node .heat-bar {
+  rx: 2; ry: 2;
+  opacity: 0.7;
+}
+
+.node .label-index {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  fill: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
+.node .label-name {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  fill: var(--text-primary);
+}
+
+.node .label-metric {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  fill: var(--text-secondary);
+  letter-spacing: 0.2px;
+}
+
+.node .label-rt {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  fill: var(--text-muted);
+  letter-spacing: 0.3px;
+}
+
+.node .rt-badge {
+  rx: 3; ry: 3;
+}
+
+.node .rt-badge-text {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+
+.node .type-badge {
+  rx: 3; ry: 3;
+}
+
+.node .type-badge-text {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+/* ── Edge styles ── */
+.edge path {
+  fill: none;
+  stroke-width: 1.2;
+  opacity: 0.5;
+  transition: opacity 0.3s ease, stroke-width 0.3s ease;
+}
+
+.edge.rt-flow path {
+  stroke-width: 2;
+  opacity: 0.7;
+  stroke-dasharray: 6 3;
+}
+
+.edge.dimmed path { opacity: 0.06; }
+.edge.highlighted path { opacity: 0.8; stroke-width: 2; }
+.edge.rt-flow.highlighted path { stroke-width: 2.5; }
+
+.edge .edge-label-bg {
+  rx: 3; ry: 3;
+  fill: var(--bg-card);
+  stroke: var(--border-subtle);
+  stroke-width: 0.5;
+}
+
+.edge .edge-label {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  fill: var(--text-muted);
+  letter-spacing: 0.3px;
+}
+
+/* ── Flow particles ── */
+.flow-particle {
+  fill: var(--accent-cyan);
+  opacity: 0;
+}
+
+/* ── Tooltip ── */
+#tooltip {
+  position: fixed;
+  display: none;
+  z-index: 200;
+  pointer-events: none;
+  max-width: 380px;
+  font-family: var(--font-sans);
+}
+
+#tooltip .tt-card {
+  background: rgba(19,23,32,0.92);
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  border: 1px solid var(--border-mid);
+  border-radius: 10px;
+  padding: 14px 18px;
+  box-shadow:
+    0 8px 32px rgba(0,0,0,0.5),
+    0 0 1px rgba(0,212,255,0.2);
+}
+
+.tt-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.tt-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tt-name {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.tt-index {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.tt-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 20px;
+}
+
+.tt-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.tt-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.tt-value {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* ── Legend ── */
+#legend {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  z-index: 40;
+  display: flex;
+  gap: 14px;
+  padding: 8px 14px;
+  background: rgba(13,16,23,0.8);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+
+/* ── Minimap ── */
+#minimap {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  width: 180px;
+  height: 120px;
+  background: rgba(13,16,23,0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  z-index: 40;
+  overflow: hidden;
+}
+
+#minimap svg {
+  width: 100%;
+  height: 100%;
+}
+
+#minimap .viewport-rect {
+  fill: rgba(0,212,255,0.08);
+  stroke: var(--accent-cyan);
+  stroke-width: 1;
+  rx: 2; ry: 2;
+}
+
+/* ── Glow defs ── */
+.glow-filter { flood-color: var(--accent-cyan); }
+
+/* ── Selection ring ── */
+.node .select-ring {
+  fill: none;
+  stroke: var(--accent-cyan);
+  stroke-width: 2;
+  rx: 10; ry: 10;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.node.selected .select-ring {
+  opacity: 1;
+  filter: url(#glowFilter);
+}
+
+/* ── Scrollbar hiding ── */
+::-webkit-scrollbar { display: none; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="logo">
+    <div class="logo-icon">RG</div>
+    <span class="logo-text">RENDER GRAPH</span>
+  </div>
+  <div class="divider"></div>
+  <div class="stat-group">
+    <span class="stat">passes <span class="val" id="s-passes">0</span></span>
+    <span class="stat">deps <span class="val" id="s-deps">0</span></span>
+    <span class="stat">tris <span class="val" id="s-tris">0</span></span>
+  </div>
+  <div class="controls">
+    <div id="search-wrap">
+      <span id="search-icon">&#x2315;</span>
+      <input id="search" type="text" placeholder="filter passes..." spellcheck="false">
+    </div>
+    <button class="btn active" id="btn-lr" onclick="setDir('LR')">LR</button>
+    <button class="btn" id="btn-tb" onclick="setDir('TB')">TB</button>
+    <button class="btn btn-icon" onclick="fitView()" title="Fit view">&#x2922;</button>
+    <button class="btn btn-icon" id="btn-flow" onclick="toggleFlow()" title="Toggle flow animation">&#x2192;</button>
+  </div>
+</div>
+
+<svg id="canvas">
+  <defs>
+    <filter id="glowFilter" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feFlood flood-color="var(--accent-cyan)" flood-opacity="0.4" result="color"/>
+      <feComposite in="color" in2="blur" operator="in" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="shadowFilter" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="6" flood-color="#000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="var(--border-bright)" opacity="0.6"/>
+    </marker>
+    <marker id="arrowheadCyan" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="var(--accent-cyan)" opacity="0.7"/>
+    </marker>
+  </defs>
+</svg>
+
+<div id="tooltip">
+  <div class="tt-card" id="tt-inner"></div>
+</div>
+
+<div id="legend">
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--heat-cold)"></span>low</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--heat-cool)"></span>med</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--heat-warm)"></span>high</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--heat-hot)"></span>hot</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--heat-fire)"></span>fire</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--compute-blue)"></span>compute</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:var(--accent-cyan);width:16px;height:2px;border-radius:0;border-top:1px dashed var(--accent-cyan)"></span>RT flow</span>
+</div>
+
+<div id="minimap"><svg id="minimap-svg"></svg></div>
+
+<script>
+// ── Data ──
+const DATA = /*GRAPH_DATA*/;
+const nodes = DATA.nodes;
+const edges = DATA.edges;
+
+// ── State ──
+let rankdir = "LR";
+let selectedId = null;
+let flowEnabled = true;
+let flowAnimId = null;
+
+const NODE_W = 220, NODE_H = 100;
+
+// ── Stats ──
+document.getElementById("s-passes").textContent = nodes.length;
+document.getElementById("s-deps").textContent = edges.length;
+const totalTri = nodes.reduce((s, n) => s + n.triangles, 0);
+document.getElementById("s-tris").textContent = totalTri >= 1e6
+  ? (totalTri / 1e6).toFixed(1) + "M" : totalTri >= 1e3
+  ? (totalTri / 1e3).toFixed(1) + "K" : totalTri;
+
+// ── Thermal palette ──
+function heatColor(tri, maxTri) {
+  if (maxTri === 0) return "var(--heat-cold)";
+  const r = tri / maxTri;
+  if (r > 0.6)  return "var(--heat-fire)";
+  if (r > 0.35) return "var(--heat-hot)";
+  if (r > 0.15) return "var(--heat-warm)";
+  if (r > 0.03) return "var(--heat-cool)";
+  return "var(--heat-cold)";
+}
+
+function heatColorHex(tri, maxTri) {
+  if (maxTri === 0) return "#1a8caa";
+  const r = tri / maxTri;
+  if (r > 0.6)  return "#d42550";
+  if (r > 0.35) return "#e85535";
+  if (r > 0.15) return "#d4a017";
+  if (r > 0.03) return "#22b07a";
+  return "#1a8caa";
+}
+
+const maxTri = Math.max(...nodes.map(n => n.triangles), 1);
+
+// Recolor nodes with thermal palette
+nodes.forEach(n => {
+  if (n.dispatches > 0 && n.draws === 0) {
+    n.color = "#6366f1";
+    n.nodeType = "compute";
+  } else if (n.triangles === 0 && n.draws === 0) {
+    n.color = "#1a8caa";
+    n.nodeType = "empty";
+  } else {
+    n.color = heatColorHex(n.triangles, maxTri);
+    n.nodeType = "draw";
+  }
+});
+
+// ── SVG setup ──
+const svg = d3.select("#canvas");
+const gRoot = svg.append("g").attr("class", "root");
+const gEdges = gRoot.append("g").attr("class", "edges-layer");
+const gParticles = gRoot.append("g").attr("class", "particles-layer");
+const gNodes = gRoot.append("g").attr("class", "nodes-layer");
+const tooltip = d3.select("#tooltip");
+const ttInner = d3.select("#tt-inner");
+
+// ── Zoom ──
+const zoom = d3.zoom()
+  .scaleExtent([0.05, 5])
+  .on("zoom", e => {
+    gRoot.attr("transform", e.transform);
+    updateMinimap(e.transform);
+  });
+svg.call(zoom);
+
+// ── Adjacency ──
+const adj = new Map();
+nodes.forEach(n => adj.set(n.id, new Set()));
+edges.forEach(e => {
+  if (adj.has(e.src)) adj.get(e.src).add(e.dst);
+  if (adj.has(e.dst)) adj.get(e.dst).add(e.src);
+});
+
+function getConnected(id) {
+  const s = new Set([id]);
+  if (adj.has(id)) adj.get(id).forEach(x => s.add(x));
+  return s;
+}
+
+// ── Layout ──
+let layoutCache = null;
+
+function computeLayout() {
+  const g = new dagre.graphlib.Graph();
+  g.setGraph({ rankdir, nodesep: 36, ranksep: 70, marginx: 50, marginy: 50 });
+  g.setDefaultEdgeLabel(() => ({}));
+  nodes.forEach(n => g.setNode(n.id, { width: NODE_W, height: NODE_H }));
+  edges.forEach(e => g.setEdge(e.src, e.dst));
+  dagre.layout(g);
+  layoutCache = g;
+  return g;
+}
+
+// ── Edge path (dagre-routed) ──
+function edgePath(g, e) {
+  const ed = g.edge(e.src, e.dst);
+  if (!ed || !ed.points || ed.points.length < 2) return "";
+  const line = d3.line().x(p => p.x).y(p => p.y).curve(d3.curveCatmullRom.alpha(0.5));
+  return line(ed.points);
+}
+
+// ── Render ──
+function render() {
+  const g = computeLayout();
+  gEdges.selectAll("*").remove();
+  gNodes.selectAll("*").remove();
+  gParticles.selectAll("*").remove();
+
+  // ── Draw edges ──
+  const edgeSel = gEdges.selectAll(".edge").data(edges).enter()
+    .append("g").attr("class", "edge").attr("data-src", e => e.src).attr("data-dst", e => e.dst);
+
+  edgeSel.each(function(e) {
+    const sel = d3.select(this);
+    const pathStr = edgePath(g, e);
+    if (!pathStr) return;
+
+    const isRtFlow = e.type === "rt_flow";
+    if (isRtFlow) sel.classed("rt-flow", true);
+
+    sel.append("path")
+      .attr("d", pathStr)
+      .attr("stroke", isRtFlow ? "var(--accent-cyan)" : "var(--border-bright)")
+      .attr("marker-end", isRtFlow ? "url(#arrowheadCyan)" : "url(#arrowhead)");
+
+    // Edge label (RT flow edges show the resource name)
+    if (e.label) {
+      const ed = g.edge(e.src, e.dst);
+      const mx = ed ? ed.x : (g.node(e.src).x + g.node(e.dst).x) / 2;
+      const my = ed ? ed.y : (g.node(e.src).y + g.node(e.dst).y) / 2;
+      const tw = e.label.length * 5 + 14;
+      sel.append("rect").attr("class", "edge-label-bg")
+        .attr("x", mx - tw/2).attr("y", my - 8)
+        .attr("width", tw).attr("height", 14)
+        .attr("stroke", isRtFlow ? "rgba(0,212,255,0.3)" : "var(--border-subtle)");
+      sel.append("text").attr("class", "edge-label")
+        .attr("x", mx).attr("y", my + 2)
+        .attr("text-anchor", "middle")
+        .attr("fill", isRtFlow ? "var(--accent-cyan)" : "var(--text-muted)")
+        .text(e.label);
+    }
+  });
+
+  // ── Draw nodes ──
+  const nodeSel = gNodes.selectAll(".node").data(nodes).enter()
+    .append("g").attr("class", "node").attr("data-id", n => n.id);
+
+  nodeSel.each(function(n) {
+    const layoutN = g.node(n.id);
+    if (!layoutN) return;
+    const sel = d3.select(this);
+    const x = layoutN.x - NODE_W/2, y = layoutN.y - NODE_H/2;
+    sel.attr("transform", `translate(${x},${y})`);
+
+    const card = sel.append("g").attr("class", "card");
+
+    // Selection ring (hidden by default)
+    card.append("rect").attr("class", "select-ring")
+      .attr("x", -3).attr("y", -3)
+      .attr("width", NODE_W + 6).attr("height", NODE_H + 6);
+
+    // Card background
+    card.append("rect").attr("class", "card-bg")
+      .attr("width", NODE_W).attr("height", NODE_H)
+      .attr("fill", "var(--bg-card)")
+      .attr("stroke", "var(--border-mid)")
+      .attr("filter", "url(#shadowFilter)");
+
+    // Left accent bar (heat color)
+    card.append("rect")
+      .attr("x", 0).attr("y", 0)
+      .attr("width", 3).attr("height", NODE_H)
+      .attr("rx", 1).attr("fill", n.color)
+      .attr("opacity", 0.9);
+
+    // Header separator
+    card.append("line").attr("class", "card-header-line")
+      .attr("x1", 12).attr("y1", 28)
+      .attr("x2", NODE_W - 10).attr("y2", 28)
+      .attr("stroke", "var(--border-subtle)");
+
+    // Pass index badge
+    card.append("text").attr("class", "label-index")
+      .attr("x", NODE_W - 10).attr("y", 16)
+      .attr("text-anchor", "end")
+      .text("#" + n.id);
+
+    // Type badge
+    if (n.nodeType === "compute") {
+      card.append("rect").attr("class", "type-badge")
+        .attr("x", NODE_W - 56).attr("y", 6)
+        .attr("width", 34).attr("height", 13)
+        .attr("fill", "rgba(99,102,241,0.2)")
+        .attr("stroke", "rgba(99,102,241,0.4)").attr("stroke-width", 0.5);
+      card.append("text").attr("class", "type-badge-text")
+        .attr("x", NODE_W - 39).attr("y", 15)
+        .attr("text-anchor", "middle")
+        .attr("fill", "#a5b4fc")
+        .text("GPU");
+    }
+
+    // Name
+    const displayName = n.name.length > 24 ? n.name.slice(0, 22) + "\u2026" : n.name;
+    card.append("text").attr("class", "label-name")
+      .attr("x", 12).attr("y", 19)
+      .text(displayName);
+
+    // Metrics
+    const parts = [];
+    if (n.draws > 0) parts.push(n.draws + "d");
+    if (n.dispatches > 0) parts.push(n.dispatches + "c");
+    if (n.triangles > 0) {
+      const t = n.triangles >= 1e6 ? (n.triangles/1e6).toFixed(1)+"M"
+              : n.triangles >= 1e3 ? (n.triangles/1e3).toFixed(1)+"K"
+              : n.triangles;
+      parts.push(t + " tri");
+    }
+    card.append("text").attr("class", "label-metric")
+      .attr("x", 12).attr("y", 46)
+      .text(parts.join("  \u00b7  "));
+
+    // RT badges: Color targets + Depth target
+    let rtX = 12;
+    const rtY = 58;
+    const cts = n.color_targets || [];
+    const dt = n.depth_target;
+
+    cts.forEach((ct, ci) => {
+      const label = "C" + (cts.length > 1 ? ci : "") + " " + (ct.format || "?");
+      const bw = label.length * 5.5 + 8;
+      card.append("rect").attr("class", "rt-badge")
+        .attr("x", rtX).attr("y", rtY - 9)
+        .attr("width", bw).attr("height", 14)
+        .attr("fill", "rgba(0,212,255,0.08)")
+        .attr("stroke", "rgba(0,212,255,0.25)").attr("stroke-width", 0.5);
+      card.append("text").attr("class", "rt-badge-text")
+        .attr("x", rtX + 4).attr("y", rtY + 1)
+        .attr("fill", "var(--accent-cyan)")
+        .text(label);
+      rtX += bw + 4;
+    });
+
+    if (dt && dt.format) {
+      const label = "D " + dt.format;
+      const bw = label.length * 5.5 + 8;
+      card.append("rect").attr("class", "rt-badge")
+        .attr("x", rtX).attr("y", rtY - 9)
+        .attr("width", bw).attr("height", 14)
+        .attr("fill", "rgba(255,170,50,0.08)")
+        .attr("stroke", "rgba(255,170,50,0.25)").attr("stroke-width", 0.5);
+      card.append("text").attr("class", "rt-badge-text")
+        .attr("x", rtX + 4).attr("y", rtY + 1)
+        .attr("fill", "#ffaa32")
+        .text(label);
+    }
+
+    // EID range
+    if (n.begin_eid) {
+      card.append("text").attr("class", "label-rt")
+        .attr("x", 12).attr("y", 80)
+        .text("EID " + n.begin_eid);
+    }
+
+    // Heat bar (bottom)
+    if (n.triangles > 0 && maxTri > 0) {
+      const barW = Math.max((n.triangles / maxTri) * (NODE_W - 24), 4);
+      card.append("rect").attr("class", "heat-bar")
+        .attr("x", 12).attr("y", NODE_H - 6)
+        .attr("width", barW).attr("height", 3)
+        .attr("fill", n.color);
+    }
+
+    // ── Hover / click ──
+    sel.on("mouseover", (event) => {
+      showTooltip(event, n);
+      if (selectedId === null) highlightConnected(n.id);
+    });
+    sel.on("mousemove", (event) => {
+      tooltip.style("left", (event.clientX + 14) + "px")
+        .style("top", (event.clientY + 14) + "px");
+    });
+    sel.on("mouseout", () => {
+      tooltip.style("display", "none");
+      if (selectedId === null) clearHighlight();
+    });
+    sel.on("click", (event) => {
+      event.stopPropagation();
+      if (selectedId === n.id) {
+        selectedId = null;
+        clearHighlight();
+        gNodes.selectAll(".node").classed("selected", false);
+      } else {
+        selectedId = n.id;
+        highlightConnected(n.id);
+        gNodes.selectAll(".node").classed("selected", false);
+        sel.classed("selected", true);
+      }
+    });
+  });
+
+  // Click canvas to deselect
+  svg.on("click", () => {
+    selectedId = null;
+    clearHighlight();
+    gNodes.selectAll(".node").classed("selected", false);
+  });
+
+  // ── Flow particles ──
+  if (flowEnabled) startFlow(g);
+
+  // ── Minimap ──
+  drawMinimap(g);
+
+  // ── Fit ──
+  fitView();
+}
+
+// ── Highlight ──
+function highlightConnected(id) {
+  const connected = getConnected(id);
+  gNodes.selectAll(".node")
+    .classed("dimmed", n => !connected.has(n.id))
+    .classed("highlighted", n => connected.has(n.id));
+  gEdges.selectAll(".edge")
+    .classed("dimmed", function() {
+      const s = +this.getAttribute("data-src"), d = +this.getAttribute("data-dst");
+      return !(connected.has(s) && connected.has(d));
+    })
+    .classed("highlighted", function() {
+      const s = +this.getAttribute("data-src"), d = +this.getAttribute("data-dst");
+      return connected.has(s) && connected.has(d);
+    });
+}
+
+function clearHighlight() {
+  gNodes.selectAll(".node").classed("dimmed", false).classed("highlighted", false);
+  gEdges.selectAll(".edge").classed("dimmed", false).classed("highlighted", false);
+}
+
+// ── Tooltip ──
+function showTooltip(event, n) {
+  const triStr = n.triangles >= 1e6 ? (n.triangles/1e6).toFixed(2)+"M"
+               : n.triangles.toLocaleString();
+  tooltip.style("display", "block")
+    .style("left", (event.clientX + 14) + "px")
+    .style("top", (event.clientY + 14) + "px");
+  const ctHtml = (n.color_targets || []).map((ct, i) =>
+    `<div class="tt-row"><span class="tt-label" style="color:var(--accent-cyan)">COLOR${(n.color_targets||[]).length>1?i:''}</span><span class="tt-value">${ct.name || '?'}<br><small style="color:var(--text-muted)">${ct.format}</small></span></div>`
+  ).join('');
+  const dtHtml = n.depth_target ?
+    `<div class="tt-row"><span class="tt-label" style="color:#ffaa32">DEPTH</span><span class="tt-value">${n.depth_target.name || '?'}<br><small style="color:var(--text-muted)">${n.depth_target.format}</small></span></div>` : '';
+
+  ttInner.html(`
+    <div class="tt-header">
+      <span class="tt-dot" style="background:${n.color}"></span>
+      <span class="tt-name">${n.name}</span>
+      <span class="tt-index">#${n.id}</span>
+    </div>
+    <div class="tt-grid">
+      <div class="tt-row"><span class="tt-label">DRAWS</span><span class="tt-value">${n.draws}</span></div>
+      <div class="tt-row"><span class="tt-label">TRIS</span><span class="tt-value">${triStr}</span></div>
+      <div class="tt-row"><span class="tt-label">EID</span><span class="tt-value">${n.begin_eid || '-'}</span></div>
+      <div></div>
+      ${ctHtml}
+      ${dtHtml}
+    </div>
+  `);
+}
+
+// ── Flow particles ──
+function startFlow(g) {
+  if (flowAnimId) cancelAnimationFrame(flowAnimId);
+  gParticles.selectAll("*").remove();
+
+  const particles = [];
+  edges.forEach((e, i) => {
+    const pathStr = edgePath(g, e);
+    if (!pathStr) return;
+    const tmpPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    tmpPath.setAttribute("d", pathStr);
+    const len = tmpPath.getTotalLength();
+    const count = Math.max(1, Math.floor(len / 120));
+    for (let j = 0; j < count; j++) {
+      const circle = gParticles.append("circle")
+        .attr("class", "flow-particle")
+        .attr("r", 2);
+      particles.push({
+        el: circle,
+        path: tmpPath,
+        len,
+        offset: j / count,
+        speed: 0.0004 + Math.random() * 0.0002,
+        edgeColor: heatColorHex(
+          nodes.find(n => n.id === e.src)?.triangles || 0, maxTri
+        ),
+      });
+    }
+  });
+
+  let last = performance.now();
+  function animate(ts) {
+    const dt = ts - last;
+    last = ts;
+    particles.forEach(p => {
+      p.offset = (p.offset + p.speed * dt) % 1;
+      const pt = p.path.getPointAtLength(p.offset * p.len);
+      p.el.attr("cx", pt.x).attr("cy", pt.y)
+        .attr("fill", p.edgeColor)
+        .attr("opacity", 0.6 + 0.4 * Math.sin(p.offset * Math.PI));
+    });
+    flowAnimId = requestAnimationFrame(animate);
+  }
+  flowAnimId = requestAnimationFrame(animate);
+}
+
+function stopFlow() {
+  if (flowAnimId) cancelAnimationFrame(flowAnimId);
+  flowAnimId = null;
+  gParticles.selectAll("*").remove();
+}
+
+function toggleFlow() {
+  flowEnabled = !flowEnabled;
+  document.getElementById("btn-flow").classList.toggle("active", flowEnabled);
+  if (flowEnabled && layoutCache) startFlow(layoutCache);
+  else stopFlow();
+}
+
+// ── Minimap ──
+const mmSvg = d3.select("#minimap-svg");
+const mmG = mmSvg.append("g");
+const mmViewport = mmSvg.append("rect").attr("class", "viewport-rect");
+
+function drawMinimap(g) {
+  mmG.selectAll("*").remove();
+  const scale = 0.06;
+  nodes.forEach(n => {
+    const ln = g.node(n.id);
+    if (!ln) return;
+    mmG.append("rect")
+      .attr("x", ln.x * scale)
+      .attr("y", ln.y * scale)
+      .attr("width", NODE_W * scale)
+      .attr("height", NODE_H * scale)
+      .attr("fill", n.color)
+      .attr("rx", 1)
+      .attr("opacity", 0.8);
+  });
+  edges.forEach(e => {
+    const s = g.node(e.src), d = g.node(e.dst);
+    if (!s || !d) return;
+    mmG.append("line")
+      .attr("x1", s.x * scale).attr("y1", s.y * scale)
+      .attr("x2", d.x * scale).attr("y2", d.y * scale)
+      .attr("stroke", "var(--border-mid)")
+      .attr("stroke-width", 0.5);
+  });
+}
+
+function updateMinimap(transform) {
+  const vw = window.innerWidth, vh = window.innerHeight - 48;
+  const mmW = 180, mmH = 120;
+  const scale = 0.06;
+  const rx = (-transform.x / transform.k) * scale;
+  const ry = (-transform.y / transform.k) * scale;
+  const rw = (vw / transform.k) * scale;
+  const rh = (vh / transform.k) * scale;
+  mmViewport.attr("x", rx).attr("y", ry).attr("width", rw).attr("height", rh);
+}
+
+// ── Fit view ──
+function fitView() {
+  const bbox = gRoot.node().getBBox();
+  if (bbox.width === 0) return;
+  const vw = window.innerWidth, vh = window.innerHeight - 48;
+  const scale = Math.min(vw / (bbox.width + 100), vh / (bbox.height + 100), 1.8);
+  const tx = (vw - bbox.width * scale) / 2 - bbox.x * scale;
+  const ty = (vh - bbox.height * scale) / 2 - bbox.y * scale;
+  svg.transition().duration(600).ease(d3.easeCubicOut)
+    .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+}
+
+// ── Direction toggle ──
+function setDir(dir) {
+  rankdir = dir;
+  document.getElementById("btn-lr").classList.toggle("active", dir === "LR");
+  document.getElementById("btn-tb").classList.toggle("active", dir === "TB");
+  render();
+}
+
+// ── Search ──
+const searchInput = document.getElementById("search");
+searchInput.addEventListener("input", () => {
+  const q = searchInput.value.toLowerCase().trim();
+  if (!q) {
+    clearHighlight();
+    return;
+  }
+  const matched = new Set();
+  nodes.forEach(n => {
+    if (n.name.toLowerCase().includes(q)) matched.add(n.id);
+  });
+  if (matched.size === 0) {
+    clearHighlight();
+    return;
+  }
+  gNodes.selectAll(".node")
+    .classed("dimmed", n => !matched.has(n.id))
+    .classed("highlighted", n => matched.has(n.id));
+  gEdges.selectAll(".edge")
+    .classed("dimmed", function() {
+      const s = +this.getAttribute("data-src"), d = +this.getAttribute("data-dst");
+      return !(matched.has(s) && matched.has(d));
+    })
+    .classed("highlighted", function() {
+      const s = +this.getAttribute("data-src"), d = +this.getAttribute("data-dst");
+      return matched.has(s) && matched.has(d);
+    });
+});
+
+// Keyboard shortcut: / to focus search
+document.addEventListener("keydown", (e) => {
+  if (e.key === "/" && document.activeElement !== searchInput) {
+    e.preventDefault();
+    searchInput.focus();
+  }
+  if (e.key === "Escape") {
+    searchInput.value = "";
+    searchInput.blur();
+    selectedId = null;
+    clearHighlight();
+    gNodes.selectAll(".node").classed("selected", false);
+  }
+});
+
+// ── Init ──
+document.getElementById("btn-flow").classList.add("active");
+render();
+window.addEventListener("resize", () => { render(); });
+</script>
+</body>
+</html>

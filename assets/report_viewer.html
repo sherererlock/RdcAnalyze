@@ -1,0 +1,1580 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>性能分析报告</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #f0f2f5;
+  --surface: #ffffff;
+  --header-bg: #2c3e6b;
+  --header-text: #ffffff;
+  --border: #e4e8ee;
+  --border-light: #f0f2f5;
+  --text: #1a1a2e;
+  --text-secondary: #5a6577;
+  --text-muted: #9ba3af;
+  --accent: #3b6cb5;
+  --accent-light: #e8f0fe;
+  --font-ui: 'Noto Sans SC', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Consolas', monospace;
+  --shadow: 0 1px 3px rgba(0,0,0,.06), 0 1px 2px rgba(0,0,0,.04);
+  --shadow-lg: 0 4px 12px rgba(0,0,0,.08);
+  /* Category colors */
+  --c-unity-native: #e67e22;
+  --c-unity-managed: #27ae60;
+  --c-graphics: #e74c3c;
+  --c-code: #3498db;
+  --c-lua-vm: #9b59b6;
+  --c-java-runtime: #1abc9c;
+  --c-third-party: #f39c12;
+  --c-unknown: #95a5a6;
+  /* Phase colors */
+  --p1: #3498db; --p2: #e67e22; --p3: #27ae60; --p4: #e74c3c;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 14px; }
+body { font-family: var(--font-ui); background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.6; }
+
+/* ── Drop Zone ─────────────────────────────────────── */
+#dropzone {
+  position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  z-index: 100; background: var(--bg); transition: opacity .3s;
+}
+#dropzone.hidden { display: none; }
+#dropzone.drag-over .dz-box { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-light); }
+.dz-box {
+  border: 2px dashed var(--border); border-radius: 16px; padding: 60px 80px;
+  text-align: center; transition: all .2s; max-width: 520px; cursor: pointer; background: var(--surface);
+}
+.dz-box:hover { border-color: var(--accent); }
+.dz-icon { font-size: 48px; color: var(--text-muted); margin-bottom: 12px; }
+.dz-title { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+.dz-sub { color: var(--text-secondary); font-size: 13px; margin-bottom: 16px; }
+.dz-files { display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; }
+.dz-file-tag { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 3px 10px; font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); }
+#file-input { display: none; }
+#drop-overlay {
+  position: fixed; inset: 0; background: rgba(44,62,107,.15); display: none;
+  align-items: center; justify-content: center; z-index: 200;
+  font-size: 18px; font-weight: 700; color: var(--accent); border: 3px dashed var(--accent); pointer-events: none;
+}
+#drop-overlay.visible { display: flex; }
+
+/* ── App Layout ────────────────────────────────────── */
+#app { display: none; }
+#app.visible { display: block; }
+
+.header {
+  background: var(--header-bg); color: var(--header-text);
+  padding: 14px 28px; display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+}
+.header-title { font-weight: 700; font-size: 16px; letter-spacing: .5px; white-space: nowrap; }
+.header-meta { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+.meta-item { display: flex; align-items: center; gap: 5px; font-size: 12px; opacity: .85; }
+.meta-item strong { opacity: 1; font-family: var(--font-mono); font-weight: 600; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-family: var(--font-mono); font-weight: 600; }
+.badge-mem { background: rgba(39,174,96,.2); color: #2ecc71; }
+.badge-perf { background: rgba(230,126,34,.2); color: #f39c12; }
+.header-actions { margin-left: auto; display: flex; gap: 8px; }
+.btn {
+  background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.25);
+  color: var(--header-text); padding: 5px 14px; border-radius: 4px; font-size: 12px;
+  font-family: var(--font-ui); cursor: pointer; transition: all .15s;
+}
+.btn:hover { background: rgba(255,255,255,.25); }
+
+/* ── Tab Bar ───────────────────────────────────────── */
+.tab-bar {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 0 28px; display: flex; gap: 0; box-shadow: var(--shadow);
+}
+.tab {
+  padding: 12px 24px; font-size: 14px; font-weight: 500; color: var(--text-secondary);
+  cursor: pointer; border-bottom: 2px solid transparent; transition: all .15s; user-select: none;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 700; }
+.tab.disabled { opacity: .35; cursor: not-allowed; }
+
+/* ── Content ───────────────────────────────────────── */
+.tab-content { display: none; padding: 20px 28px; max-width: 1400px; margin: 0 auto; }
+.tab-content.active { display: block; }
+
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 20px; margin-bottom: 16px; box-shadow: var(--shadow);
+}
+.card-title {
+  font-size: 15px; font-weight: 700; color: var(--text); margin-bottom: 4px;
+  display: flex; align-items: center; gap: 8px;
+}
+.card-subtitle { font-size: 12px; color: var(--text-muted); margin-bottom: 16px; }
+.card-hint { font-size: 12px; color: var(--accent); margin-bottom: 12px; }
+
+/* ── Inline Help ──────────────────────────────────── */
+.help-toggle {
+  width: 20px; height: 20px; border-radius: 50%; border: 1.5px solid var(--accent);
+  background: var(--accent-light); color: var(--accent); font-size: 11px; font-weight: 700;
+  font-family: var(--font-mono); cursor: pointer; display: inline-flex;
+  align-items: center; justify-content: center; transition: all .15s; padding: 0; line-height: 1;
+  flex-shrink: 0;
+}
+.help-toggle:hover, .help-toggle.active {
+  background: var(--accent); color: #fff;
+}
+.card-help {
+  display: none; background: var(--accent-light); border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 16px;
+  font-size: 12px; line-height: 1.7; color: var(--text-secondary);
+}
+.card-help.open { display: block; }
+.card-help dl { margin: 0; }
+.card-help dt {
+  font-weight: 600; color: var(--accent); display: inline; margin: 0;
+}
+.card-help dt::after { content: '：'; }
+.card-help dd {
+  display: inline; margin: 0 0 0 0;
+}
+.card-help dd::after { content: ''; display: block; margin-bottom: 6px; }
+.card-help dd:last-child::after { margin-bottom: 0; }
+.card-help code {
+  background: rgba(59,108,181,.1); padding: 1px 5px; border-radius: 3px;
+  font-family: var(--font-mono); font-size: 11px;
+}
+.cat-tip {
+  position: relative; cursor: help;
+  border-bottom: 1px dashed var(--text-muted);
+}
+.cat-tip::after {
+  content: attr(data-tip); position: absolute; bottom: calc(100% + 6px); left: 0;
+  background: rgba(26,26,46,.92); color: #fff;
+  padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 400;
+  font-family: var(--font-ui); pointer-events: none;
+  opacity: 0; transition: opacity .15s; z-index: 10;
+  box-shadow: 0 4px 12px rgba(0,0,0,.2); width: max-content; max-width: 420px; white-space: pre-line;
+}
+.cat-tip:hover::after { opacity: 1; }
+.doc-link { cursor: pointer; color: var(--accent); border-bottom: 1px dashed var(--accent) !important; }
+.doc-link:hover { color: #2a5a9e; }
+.doc-modal-overlay { position: fixed; inset: 0; background: rgba(26,26,46,.55); z-index: 300; display: none; justify-content: center; align-items: center; }
+.doc-modal-overlay.open { display: flex; }
+.doc-modal { background: var(--surface); border-radius: 12px; max-width: 560px; width: 90%; max-height: 80vh; overflow-y: auto; padding: 24px; box-shadow: 0 8px 32px rgba(0,0,0,.18); }
+.doc-modal-title { display: flex; justify-content: space-between; align-items: center; font-size: 16px; font-weight: 700; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.doc-modal-close { cursor: pointer; background: none; border: none; font-size: 22px; color: var(--text-muted); line-height: 1; padding: 0 4px; }
+.doc-modal-close:hover { color: var(--text); }
+.doc-modal-tag { display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; color: #fff; margin-left: 8px; }
+.doc-modal h4 { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin: 16px 0 6px; }
+.doc-modal ul { padding-left: 20px; font-size: 13px; line-height: 1.8; margin: 0; }
+.doc-modal p { font-size: 13px; line-height: 1.7; color: var(--text); margin: 4px 0; }
+.doc-modal .doc-note { font-size: 12px; color: var(--text-muted); background: var(--bg); padding: 8px 12px; border-radius: 6px; margin-top: 4px; }
+@media print { .help-toggle, .card-help, .doc-modal-overlay { display: none !important; } }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.grid-pie { display: grid; grid-template-columns: 380px 1fr; gap: 0; }
+@media (max-width: 1000px) { .grid-2, .grid-pie { grid-template-columns: 1fr; } }
+
+/* ── Icicle/Treemap Bar ────────────────────────────── */
+.icicle { margin-bottom: 16px; }
+.icicle-row { display: flex; height: 38px; margin-bottom: 2px; border-radius: 4px; overflow: hidden; position: relative; }
+.icicle-seg {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 500; color: #fff; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; padding: 0 8px; min-width: 2px; position: relative; cursor: default;
+  transition: filter .15s;
+}
+.icicle-seg:hover { filter: brightness(1.1); }
+.icicle-seg .seg-label { text-shadow: 0 1px 2px rgba(0,0,0,.3); pointer-events: none; }
+.icicle-seg[data-pct]::after { content: none; }
+.icicle-tooltip {
+  position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+  background: rgba(26,26,46,.92); color: #fff; padding: 6px 12px; border-radius: 6px;
+  font-size: 12px; font-family: var(--font-mono); white-space: nowrap;
+  pointer-events: none; opacity: 0; transition: opacity .15s; z-index: 10;
+  box-shadow: 0 4px 12px rgba(0,0,0,.2);
+}
+.icicle-seg:hover .icicle-tooltip { opacity: 1; }
+.icicle-total {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 8px;
+  font-size: 13px; color: var(--text-secondary);
+}
+.icicle-total strong { font-size: 20px; font-family: var(--font-mono); font-weight: 700; color: var(--text); }
+
+/* ── Tables ────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead { position: sticky; top: 0; z-index: 2; }
+th {
+  text-align: left; padding: 10px 12px; background: #f5f7fa; color: var(--text-secondary);
+  font-weight: 600; font-size: 12px; border-bottom: 2px solid var(--border);
+  white-space: nowrap; cursor: pointer; user-select: none;
+}
+th:hover { color: var(--accent); }
+th.sort-asc::after { content: ' \25B2'; font-size: 9px; color: var(--accent); }
+th.sort-desc::after { content: ' \25BC'; font-size: 9px; color: var(--accent); }
+th.num { text-align: right; }
+td { padding: 8px 12px; border-bottom: 1px solid var(--border-light); vertical-align: middle; }
+td.num { text-align: right; font-family: var(--font-mono); font-size: 12px; }
+td.code { font-family: var(--font-mono); font-size: 11px; word-break: break-all; max-width: 480px; color: var(--text-secondary); }
+tr:hover { background: #f8f9fb; }
+tr.highlight td { background: #fef9f0; }
+tr.child td { padding-left: 32px; color: var(--text-muted); }
+
+.cat-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: middle; flex-shrink: 0; }
+.inline-bar { display: inline-block; height: 6px; border-radius: 3px; vertical-align: middle; margin-left: 8px; }
+
+/* ── Accordion ─────────────────────────────────────── */
+.accordion { margin-bottom: 2px; }
+.accordion-header {
+  display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  cursor: pointer; transition: background .15s; margin-bottom: 2px;
+}
+.accordion-header:hover { background: #f8f9fb; }
+.accordion-arrow { font-size: 10px; color: var(--text-muted); transition: transform .2s; width: 12px; }
+.accordion-header.open .accordion-arrow { transform: rotate(90deg); }
+.accordion-label { font-size: 13px; font-weight: 500; display: flex; align-items: center; }
+.accordion-value { margin-left: auto; font-family: var(--font-mono); font-weight: 600; font-size: 13px; }
+.accordion-body {
+  display: none; padding: 12px 16px; border: 1px solid var(--border); border-top: none;
+  border-radius: 0 0 6px 6px; background: #fafbfc; margin-bottom: 4px;
+}
+.accordion-body.open { display: block; }
+
+/* ── Tags ──────────────────────────────────────────── */
+.tag { display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; font-family: var(--font-mono); }
+.tag-firebase { background: #fff3e0; color: #e65100; }
+.tag-provider { background: #e3f2fd; color: #1565c0; }
+.tag-app { background: #e8f5e9; color: #2e7d32; }
+.tag-startup { background: #f3e5f5; color: #7b1fa2; }
+.tag-other { background: #f5f5f5; color: #757575; }
+
+/* ── Phase Bar ─────────────────────────────────────── */
+.phase-bar-wrap { margin-bottom: 16px; }
+.phase-bar-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.phase-bar-label { width: 260px; font-size: 12px; color: var(--text-secondary); white-space: nowrap; text-overflow: ellipsis; flex-shrink: 0; overflow: visible; }
+.phase-bar-track { flex: 1; height: 24px; background: #f0f2f5; border-radius: 4px; position: relative; overflow: hidden; }
+.phase-bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; justify-content: flex-end; padding-right: 8px; font-size: 11px; font-family: var(--font-mono); color: #fff; font-weight: 600; min-width: 40px; transition: width .4s; }
+.phase-bar-value { font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--text); width: 80px; text-align: right; flex-shrink: 0; }
+
+/* ── Waterfall ─────────────────────────────────────── */
+.waterfall { position: relative; }
+.wf-row { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.wf-label { width: 260px; font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+.wf-track { flex: 1; height: 28px; position: relative; background: #f5f7fa; border-radius: 4px; }
+.wf-bar { position: absolute; top: 2px; height: 24px; border-radius: 4px; display: flex; align-items: center; padding: 0 8px; font-size: 11px; font-family: var(--font-mono); color: #fff; font-weight: 600; white-space: nowrap; min-width: 2px; }
+.wf-value { font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--text); width: 80px; text-align: right; flex-shrink: 0; }
+
+/* ── Empty / Skip / Print ──────────────────────────── */
+.empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+.skip-note { color: var(--text-muted); font-size: 11px; margin-top: 6px; }
+
+@media print {
+  body { background: #fff; }
+  .header { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+  .tab-bar, .header-actions, #dropzone, #drop-overlay { display: none !important; }
+  .tab-content { display: block !important; }
+  .card { break-inside: avoid; box-shadow: none; border: 1px solid #ddd; }
+  .accordion-body { display: block !important; }
+}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+</style>
+</head>
+
+<body>
+<div id="dropzone">
+  <div class="dz-box" onclick="document.getElementById('file-input').click()">
+    <div class="dz-icon">&#128202;</div>
+    <div class="dz-title">拖放报告文件到此处</div>
+    <div class="dz-sub">或点击选择文件（支持多选）</div>
+    <div class="dz-files">
+      <span class="dz-file-tag">memory_report.json</span>
+      <span class="dz-file-tag">startup_report.md</span>
+    </div>
+  </div>
+</div>
+<input type="file" id="file-input" multiple accept=".json,.md">
+<div id="drop-overlay">拖放文件以加载更多数据</div>
+
+<div id="app">
+  <div class="header">
+    <div class="header-title">PROFILING REPORT</div>
+    <div class="header-meta" id="header-meta"></div>
+    <div class="header-actions">
+      <button class="btn" onclick="document.getElementById('file-input').click()">+ 加载文件</button>
+      <button class="btn" onclick="window.print()">打印</button>
+    </div>
+  </div>
+  <div class="tab-bar">
+    <div class="tab active" data-tab="memory" onclick="switchTab('memory')">内存分析</div>
+    <div class="tab disabled" data-tab="startup" onclick="switchTab('startup')">启动性能</div>
+  </div>
+  <div class="tab-content active" id="tab-memory">
+    <div class="empty-state" id="memory-empty"><p>加载 memory_report.json 以查看内存分析</p></div>
+    <div id="memory-content" style="display:none"></div>
+  </div>
+  <div class="tab-content" id="tab-startup">
+    <div class="empty-state" id="startup-empty"><p>加载 startup_report.md 以查看启动性能分析</p></div>
+    <div id="startup-content" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════
+   Configuration
+   ═══════════════════════════════════════════════════════ */
+const CATEGORY_ORDER = ['Unity Native','Unity Managed','Graphics','Code','Lua VM','App Native','Java/Runtime','Third-party','Unknown'];
+const CATEGORY_COLORS = {
+  'Unity Native':'#e67e22','Unity Managed':'#27ae60','Graphics':'#e74c3c','Code':'#3498db',
+  'Lua VM':'#9b59b6','App Native':'#d35400','Java/Runtime':'#1abc9c','Third-party':'#f39c12','Unknown':'#95a5a6',
+};
+const PHASE_COLORS = ['#3498db','#e67e22','#27ae60','#e74c3c'];
+const PHASE_NAMES = {1:'Android OS & App Level',2:'Unity Native Engine Init',3:'Unity Managed & Boot Scene',4:'Business & Lua Framework'};
+const TAG_CLASSES = {Firebase:'tag-firebase',Provider:'tag-provider',App:'tag-app',Startup:'tag-startup',Other:'tag-other'};
+
+/* ── Inline Help Data ───────────────────────────────── */
+const CATEGORY_TIPS = {
+  'Unity Native': '引擎 C++ 层原生对象（资源 CPU 副本、场景数据、AB 缓存、allocator 区域）',
+  'Unity Managed': 'C# 托管堆（GC heap、托管对象、tolua bridge 包装），Mono/IL2CPP 管理',
+  'Graphics': 'GPU 显存（纹理、RT、Mesh buffer、Shader、GraphicBuffer、驱动内存）',
+  'Code': '可执行代码段（.so/.dex/.oat/.apk/.jar 映射），PSS 按共享进程数均分',
+  'Lua VM': 'Lua allocator 管理的内存（table/string/coroutine/userdata），lua_gc 计量',
+  'App Native': '业务 native 插件 C/C++ 分配，需 heapprofd 才能识别，否则为 0',
+  'Java/Runtime': 'Android 运行时（Dalvik heap、ART 结构、线程栈、boot image）',
+  'Third-party': 'smaps SO 文件名模式匹配识别的第三方 SDK 数据段内存',
+  'Unknown': 'Total PSS − 已归因之和，合法分类，应持续压缩',
+};
+const CATEGORY_DOCS = {
+  'Unity Native': {
+    color: '#e67e22',
+    desc: 'Unity 引擎原生层（C/C++）管理的内存，由引擎内部 allocator 分配。',
+    includes: ['Unity Native Object（Texture CPU 副本、Mesh CPU 副本、AnimationClip、AudioClip、Material 等）', 'GameObject / Component 的 native 部分', 'Scene / Prefab 实例化后的引擎侧数据', 'AssetBundle 原生缓存、序列化缓冲', 'Unity 内部 allocator 持有的 Reserved 空间', 'IL2CPP 运行时通过系统 malloc 的分配（heapprofd il2cpp*）'],
+    excludes: ['C# 托管堆对象（→ Unity Managed）', 'GPU 显存、RenderTexture（→ Graphics）', 'Lua VM heap（→ Lua VM）'],
+    calc: 'Mode A: MemoryMap "Native" Resident + heapprofd il2cpp malloc + heapprofd System/Native\nMode B（无 Unity 数据）: dumpsys Native Heap - Lua VM - Third-party（粗估）',
+    notes: 'MemoryMap Resident 是物理 RSS，不含已 mmap 但未 fault-in 的预留页。heapprofd 的 il2cpp 和 System/Native 落在 Untracked 区域，与 MemoryMap Native 不重叠。',
+  },
+  'Unity Managed': {
+    color: '#27ae60',
+    desc: 'Unity 托管运行时中的 C# 堆内存，包括 managed heap、托管对象、GC 保留空间。',
+    includes: ['C# object / string / array / List / Dictionary', '委托、闭包、协程对象', '反射缓存、静态字段持有对象', 'GC Heap / Reserved Heap / VM Memory', 'tolua bridge 在 C# 侧生成的包装对象'],
+    excludes: ['Lua 原生 table / string / userdata（→ Lua VM）', 'Unity 引擎 native object（→ Unity Native）', 'Java heap（→ Java/Runtime）'],
+    calc: 'Mode A: MemoryMap "Managed" Resident\nMode B: 无法拆分，设为 0',
+    notes: '包含 GC 堆段（SectionType == GarbageCollector）、VM 内存段、经 VM Root 再分配从 Native 转入的部分。典型问题：静态引用保活、委托未解绑、闭包引用 UI/MonoBehaviour。',
+  },
+  'Graphics': {
+    color: '#e74c3c',
+    desc: '所有图形渲染相关内存，包括 Unity 可见图形资源和底层驱动 / GraphicBuffer / Swapchain 等。',
+    includes: ['Texture GPU 显存', 'RenderTexture', 'Mesh 顶点/索引 buffer（GPU 侧）', 'Shader / Pipeline / PSO cache', 'Framebuffer / Swapchain', 'GraphicBuffer / gralloc', 'Vulkan / OpenGL / EGL 驱动图形内存'],
+    excludes: ['C# Texture 包装对象（→ Unity Managed）', 'Texture CPU 副本（→ Unity Native）'],
+    calc: 'Graphics = GL mtrack + EGL mtrack + GPU + Gfx dev + Ashmem + Other dev\n（GPU mtrack=0 时回退到 Unity totalGfxMemoryMB）',
+    notes: 'PowerVR 等不暴露 GL mtrack 的 GPU 上值可能为 0。典型问题：纹理分辨率过高、RT 过多、UI Atlas 过大、切后台后图形资源未释放。',
+  },
+  'Code': {
+    color: '#3498db',
+    desc: '进程可执行代码段占用的内存。',
+    includes: ['共享库代码段（libunity.so、libil2cpp.so、libtolua.so 等）', 'DEX 字节码映射', 'ART AOT 编译产物（oat）', 'APK 文件映射（资源、assets）', 'JAR 文件映射'],
+    excludes: ['.so 数据段属于 Third-party 或 App Native'],
+    calc: 'Code = .so mmap + .dex mmap + .oat mmap + .apk mmap + .jar mmap\n全部来自 dumpsys meminfo，是 PSS 值（共享页按映射进程数等分）。',
+    notes: '.so mmap 包含所有 SO 的可执行段（含第三方），但第三方的数据段被 smaps 单独扣除到 Third-party。代码段通常稳定，不会随游戏运行显著增长。',
+  },
+  'Lua VM': {
+    color: '#9b59b6',
+    desc: 'Lua 虚拟机及其 allocator（l_alloc）分配的内存。',
+    includes: ['lua_State', 'lua table / string / function / proto / closure', 'userdata / coroutine', 'registry / metatable', 'require / module cache（package.loaded）', 'tolua 在 Lua 侧的对象映射'],
+    excludes: ['Lua 间接引用的 C# 托管对象本体（→ Unity Managed）', 'Lua 间接保活的 Unity 资源本体（→ Unity Native / Graphics）'],
+    calc: 'Unity Memory Profiler JSON → luaMemoryKB\n通过 lua_gc(LUA_GCCOUNT) 获取精确值。',
+    notes: 'tolua 使用自定义 allocator（via lua_newstate），不经过 Unity MemoryManager。Lua 内存在 Unity MemoryMap 的 "Untracked" 区域，对 heapprofd 大部分不可见。lua_gc 是唯一可靠的计量来源。',
+  },
+  'App Native': {
+    color: '#d35400',
+    desc: '业务侧 native 代码和非引擎原生模块的内存。',
+    includes: ['自研 native plugin', 'JNI native 层对象', 'C/C++ 业务库分配', '自定义解码器/网络库/压缩库 buffer'],
+    excludes: ['Unity 引擎 native object（→ Unity Native）', 'Lua VM（→ Lua VM）', '第三方 SDK native（→ Third-party）'],
+    calc: 'heapprofd 中不属于 il2cpp* / com.unity3d.* / lua_* / (system/native) 的函数归为 App Native。\n无 heapprofd 时此项为 0。',
+    notes: '需要 heapprofd 数据才能识别。典型问题：native cache 不释放、JNI 全局引用泄漏、自定义 buffer 常驻。',
+  },
+  'Java/Runtime': {
+    color: '#1abc9c',
+    desc: 'Android 应用运行时相关内存。',
+    includes: ['Java / Kotlin 对象堆（ART GC 管理）', 'ART 内部结构（class 表、method 缓存、JIT 代码缓存）', '线程栈', 'ART boot image 映射（预编译 framework 类）'],
+    excludes: ['C# 托管堆（→ Unity Managed）'],
+    calc: 'Java/Runtime = Dalvik Heap + Dalvik Other + Stack + .art mmap\n全部来自 dumpsys meminfo。',
+    notes: 'Unity 游戏的 Java 堆通常较小。典型问题：Android 页面对象泄漏、SDK Java 单例缓存过大、线程过多、WebView 驻留。',
+  },
+  'Third-party': {
+    color: '#f39c12',
+    desc: '可明确识别归属于第三方 SDK 的内存。',
+    includes: ['广告 SDK、统计 SDK、推送 SDK、社交登录 SDK、支付 SDK', '崩溃监控 SDK', '音视频 SDK', '第三方热更/加固模块'],
+    excludes: ['第三方 SO 的可执行代码段（→ Code）'],
+    calc: 'smaps 中匹配模式列表的 .so 非可执行段（rw-p / r--p）PSS 之和。\n默认模式：libxinyoudi, libFirebase, libcrashlytics, libAntiSpam 等。',
+    notes: '仅检测数据段（非代码段），因为代码段已计入 Code。可通过 --third-party-patterns 扩展识别列表。未列出的第三方库归入 Code 或 Unknown。',
+  },
+  'Unknown': {
+    color: '#95a5a6',
+    desc: '无法被前 8 个分类覆盖的剩余内存。合法分类，应持续压缩。',
+    includes: ['Native Heap gap（heapprofd 未覆盖的 malloc）', 'Anon mmap gap（dumpsys Unknown 中 Unity MemoryMap 未覆盖的匿名页）', 'Other mmap（匿名共享/mmap 区域）', '跨数据源统计口径差异'],
+    excludes: [],
+    calc: 'Unknown = Total PSS - Σ(所有已归因项)\n即：Total PSS - Unity Native - Managed - Graphics - Code - Lua VM - App Native - Java/Runtime - Third-party',
+    notes: 'Unknown 允许存在，但应持续压缩比例。若长期过高，应补充采集能力（如接入 heapprofd、扩展 Third-party 模式列表）。错误归类比 Unknown 更有害。',
+  },
+};
+const SECTION_HELP = {
+  icicle: { lines: [
+    {dt:'PSS', dd:'Proportional Set Size，按共享比例均分的物理内存。是 Android LMK 的判定口径，也是内存优化的基准指标。'},
+    {dt:'9 分类', dd:'将 Total PSS 按归属拆分为 9 个互斥分类，每块内存只归入一类。分类基于 <code>dumpsys</code>、<code>Unity Memory Profiler</code>、<code>heapprofd</code> 三种工具交叉验证，不是简单按 dumpsys 行划分。'},
+    {dt:'读图', dd:'色块宽度与该分类 PSS 占比成正比。悬停可看 MB 和百分比。完整子项明细见下方「归因明细」。'},
+  ]},
+  attribution: { lines: [
+    {dt:'来源列', dd:'显示该分类数据的计算方式。不同分类使用不同数据源——并非所有数字都来自 dumpsys。'},
+    {dt:'常见缩写', dd:'<code>MemoryMap Resident</code> = Unity Memory Profiler 统计的物理 RSS；<code>dumpsys</code> = adb dumpsys meminfo；<code>heapprofd</code> = Perfetto 原生堆采样；<code>smaps</code> = /proc/pid/smaps 扫描。'},
+    {dt:'值为 0', dd:'某些分类（如 App Native）需要 heapprofd 数据才能拆分。未采集时显示 0，表示「无法测量」而非真正为零。'},
+  ]},
+  dumpsys: { lines: [
+    {dt:'dumpsys meminfo', dd:'Android 系统命令 <code>adb shell dumpsys meminfo</code> 的输出，按内存段类型逐行统计 PSS。是最基础的 Android 内存数据源。'},
+    {dt:'与 9 分类的关系', dd:'dumpsys 的行 ≠ 报告的 9 分类。例如 <code>Native Heap</code> 混合了 Unity / Lua / App 多种分配，需要 Unity Profiler 和 heapprofd 才能拆分。<code>Unknown</code> 是匿名 mmap 区域，占比大是正常的。'},
+  ]},
+  heapprofd: { lines: [
+    {dt:'heapprofd', dd:'Android Perfetto 的原生堆采样工具。对系统 <code>malloc/free</code> 做调用栈采样，揭示哪些 C/C++ 函数分配了多少内存。'},
+    {dt:'驻留', dd:'分配 − 释放 = 驻留，表示采样时刻仍在使用的内存量。'},
+    {dt:'分类汇总', dd:'根据函数名前缀（<code>il2cpp</code>、<code>lua_</code> 等）自动映射到 9 分类体系。<code>System/Native</code> 是无调用栈的系统分配器开销，归入 Unity Native。'},
+    {dt:'精度', dd:'heapprofd 是采样式 profiler，小分配可能遗漏。总驻留量通常 ≤ dumpsys Native Heap。'},
+  ]},
+  detail: { lines: [
+    {dt:'用途', dd:'展开每个分类可查看子项构成。例如 Unity Native 可看 MemoryMap Resident、il2cpp malloc、System/Native 各占多少。'},
+    {dt:'来源行', dd:'每个分类的「来源」说明数据计算公式。采集模式不同（完整 / 基础 / 退化），公式也不同。'},
+    {dt:'悬浮提示', dd:'鼠标悬停在分类名上可快速查看该分类包含哪些内容。'},
+  ]},
+};
+
+/* ═══════════════════════════════════════════════════════
+   State
+   ═══════════════════════════════════════════════════════ */
+let memoryData = null, startupData = null, unknownData = null, detailedData = null;
+let chartInstances = {};
+let pieCounter = 0;
+
+/* __INJECTED_DATA__ */
+
+/* ═══════════════════════════════════════════════════════
+   Init
+   ═══════════════════════════════════════════════════════ */
+document.addEventListener('DOMContentLoaded', () => {
+  if (memoryData || startupData) { render(); return; }
+  const dz = document.getElementById('dropzone');
+  const fi = document.getElementById('file-input');
+  const overlay = document.getElementById('drop-overlay');
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+  dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag-over'); processFiles(e.dataTransfer.files); });
+  fi.addEventListener('change', e => { processFiles(e.target.files); fi.value = ''; });
+  document.body.addEventListener('dragover', e => { e.preventDefault(); if (!dz.classList.contains('hidden')) return; overlay.classList.add('visible'); });
+  document.body.addEventListener('dragleave', e => { if (e.relatedTarget && document.body.contains(e.relatedTarget)) return; overlay.classList.remove('visible'); });
+  document.body.addEventListener('drop', e => { e.preventDefault(); overlay.classList.remove('visible'); if (!dz.classList.contains('hidden')) return; processFiles(e.dataTransfer.files); });
+});
+
+async function processFiles(fileList) {
+  for (const file of fileList) {
+    const text = await file.text();
+    const name = file.name.toLowerCase();
+    if (name === 'memory_report.json') { try { memoryData = JSON.parse(text); } catch(e) { alert('JSON 解析失败: ' + e.message); } }
+    else if (name === 'unknown_breakdown.json') { try { unknownData = JSON.parse(text); } catch(e) {} }
+    else if (name === 'startup_report.md') { startupData = parseStartupMD(text); }
+    else if (name.endsWith('.json')) { try { const o = JSON.parse(text); if (o.attribution && o.totalPssMB) memoryData = o; else if (o.unknownBreakdown) unknownData = o; } catch(e) {} }
+    else if (name.endsWith('.md') && (text.includes('Startup Performance Report') || text.includes('Phase Breakdown'))) { startupData = parseStartupMD(text); }
+  }
+  render();
+}
+
+/* ═══════════════════════════════════════════════════════
+   Startup MD Parser
+   ═══════════════════════════════════════════════════════ */
+function parseStartupMD(text) {
+  const r = { totalSeconds:0, package:'', phases:[], milestones:[], phaseDetails:{}, sdkInit:{bindDurationMs:0,entries:[]} };
+  const hdr = text.match(/\*\*Total:\s*([\d.]+)\s*s\*\*\s*\|\s*Package:\s*`([^`]+)`/);
+  if (hdr) { r.totalSeconds = parseFloat(hdr[1]); r.package = hdr[2]; }
+  const sections = text.split(/^## /gm);
+  for (const sec of sections) {
+    const title = sec.split('\n')[0].trim();
+    if (title === 'Phase Breakdown') {
+      r.phases = parseMDTable(sec, row => ({ phase:parseInt(row[0])||0, name:row[1]||'', wallMs:row[2]==='\u2014'||row[2]==='—'?null:parseFloat(row[2]), sliceMs:parseFloat(row[3])||0, pct:parseFloat(row[4])||0 }));
+    } else if (title === 'Key Milestones') {
+      r.milestones = parseMDTable(sec, row => ({ offsetMs:parseFloat((row[0]||'').replace(/[+ms]/g,''))||0, event:stripBt(row[1]||''), durationMs:parseFloat((row[2]||'').replace(/ms/g,''))||0, thread:row[3]||'' }));
+    } else if (title.startsWith('Phase Detail')) {
+      const phSections = sec.split(/^### /gm).slice(1);
+      for (const ps of phSections) {
+        const pm = ps.match(/Phase\s+(\d+)/); if (!pm) continue;
+        r.phaseDetails[parseInt(pm[1])] = parseMDTable(ps, row => ({ rank:parseInt(row[0])||0, name:stripBt(row[1]||''), totalMs:parseFloat(row[2])||0, count:parseInt(row[3])||0, maxMs:parseFloat(row[4])||0 })).filter(x => x.rank > 0);
+      }
+    } else if (title.startsWith('SDK & ContentProvider Init')) {
+      const bm = sec.match(/\*\*bindApplication:\s*([\d.]+)\s*ms\*\*/);
+      if (bm) r.sdkInit.bindDurationMs = parseFloat(bm[1]);
+      r.sdkInit.entries = parseMDTable(sec, row => {
+        const raw = row[1]||''; const isChild = raw.trim().startsWith('—') || raw.trim().startsWith('\u2014');
+        return { rank:row[0]?parseInt(row[0]):null, name:stripBt(raw.replace(/^[\s\u2014—]+/,'').trim()), isChild, durationMs:parseFloat(row[2])||0, tag:(row[3]||'').trim() };
+      });
+    }
+  }
+  return r;
+}
+function parseMDTable(sec, mapper) {
+  const rows = []; let past = false;
+  for (const line of sec.split('\n')) {
+    const t = line.trim(); if (!t.startsWith('|')) continue;
+    if (t.includes('---')) { past = true; continue; } if (!past) continue;
+    if (t.includes('*more') || t.includes('*(')) continue;
+    const cells = t.split('|').slice(1,-1).map(c => c.trim()); if (cells.length < 2) continue;
+    try { rows.push(mapper(cells)); } catch(e) {}
+  }
+  return rows;
+}
+function stripBt(s) { return s.replace(/`/g, ''); }
+
+/* ═══════════════════════════════════════════════════════
+   Detailed Memory MD Parser
+   ═══════════════════════════════════════════════════════ */
+function parseDetailedMD(text) {
+  const result = {};
+  const catSections = text.split(/^### /gm).slice(1);
+  for (const sec of catSections) {
+    const firstLine = sec.split('\n')[0];
+    const nameMatch = firstLine.match(/^(.+?)\s*[—\u2014]/);
+    if (!nameMatch) continue;
+    const catName = nameMatch[1].trim();
+    const tables = [];
+    let curTitle = '';
+    const lines = sec.split('\n');
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i].trim();
+      const boldMatch = line.match(/^\*\*(.+?):?\*\*\s*$/);
+      if (boldMatch) { curTitle = boldMatch[1].replace(/:$/, '').trim(); i++; continue; }
+      if (line.startsWith('|') && !line.includes('---')) {
+        const headerCells = line.split('|').slice(1, -1).map(c => c.trim());
+        if (i + 1 < lines.length && lines[i + 1].trim().includes('---')) {
+          i += 2;
+          const rows = [];
+          while (i < lines.length) {
+            const rl = lines[i].trim();
+            if (!rl.startsWith('|')) break;
+            if (rl.includes('*more') || rl.includes('*(')) { i++; continue; }
+            rows.push(rl.split('|').slice(1, -1).map(c => c.trim().replace(/`/g, '')));
+            i++;
+          }
+          if (rows.length > 0) tables.push({ title: curTitle, headers: headerCells, rows });
+          continue;
+        }
+      }
+      i++;
+    }
+    result[catName] = tables;
+  }
+  return result;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Render Main
+   ═══════════════════════════════════════════════════════ */
+function render() {
+  if (!memoryData && !startupData) return;
+  document.getElementById('dropzone').classList.add('hidden');
+  document.getElementById('app').classList.add('visible');
+  renderHeader();
+  const mTab = document.querySelector('.tab[data-tab="memory"]');
+  const sTab = document.querySelector('.tab[data-tab="startup"]');
+  mTab.classList.toggle('disabled', !memoryData);
+  sTab.classList.toggle('disabled', !startupData);
+  if (memoryData) renderMemoryTab();
+  if (startupData) renderStartupTab();
+  if (!memoryData && startupData) switchTab('startup'); else switchTab('memory');
+}
+
+function renderHeader() {
+  const m = document.getElementById('header-meta'); const p = [];
+  if (memoryData) {
+    p.push(`<span class="meta-item">包名 <strong>${memoryData.package}</strong></span>`);
+    p.push(`<span class="meta-item">时间 <strong>${memoryData.timestamp}</strong></span>`);
+    p.push(`<span class="meta-item">Total PSS <strong>${memoryData.totalPssMB} MB</strong></span>`);
+    p.push(`<span class="badge badge-mem">memory</span>`);
+  }
+  if (startupData) {
+    if (!memoryData) p.push(`<span class="meta-item">包名 <strong>${startupData.package}</strong></span>`);
+    p.push(`<span class="meta-item">启动 <strong>${startupData.totalSeconds}s</strong></span>`);
+    p.push(`<span class="badge badge-perf">startup</span>`);
+  }
+  m.innerHTML = p.join('');
+}
+
+function switchTab(tab) {
+  if (tab === 'memory' && !memoryData) return;
+  if (tab === 'startup' && !startupData) return;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tab));
+}
+
+/* ═══════════════════════════════════════════════════════
+   Memory Tab
+   ═══════════════════════════════════════════════════════ */
+function renderMemoryTab() {
+  document.getElementById('memory-empty').style.display = 'none';
+  const c = document.getElementById('memory-content'); c.style.display = 'block';
+  const d = memoryData, attr = d.attribution || {};
+
+  c.innerHTML = `
+    <div class="card">
+      <div class="card-title">PSS 内存占用 <button class="help-toggle" onclick="toggleHelp(this)" title="了解此图表">i</button></div>
+      <div class="card-subtitle">各分类内存归因总览 — 悬停色块查看明细</div>
+      <div class="card-help" id="help-icicle"></div>
+      <div id="icicle-chart"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">内存归因分布 <button class="help-toggle" onclick="toggleHelp(this)" title="了解此图表">i</button></div>
+      <div class="card-hint">按分类查看内存占用详情</div>
+      <div class="card-help" id="help-attribution"></div>
+      <div class="grid-pie">
+        <div style="display:flex;align-items:center;justify-content:center;padding:10px 0">
+          <canvas id="chart-pie" width="320" height="320"></canvas>
+        </div>
+        <div class="table-wrap" id="table-attribution"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">dumpsys meminfo 原始分类 <button class="help-toggle" onclick="toggleHelp(this)" title="了解此图表">i</button></div>
+      <div class="card-help" id="help-dumpsys"></div>
+      <div id="dumpsys-bars"></div>
+    </div>
+
+    ${d.heapprofd ? `
+    <div class="card">
+      <div class="card-title">Heapprofd 原生堆分析 <button class="help-toggle" onclick="toggleHelp(this)" title="了解此图表">i</button></div>
+      <div class="card-subtitle">
+        总分配 ${d.heapprofd.totalAllocMB} MB &middot; 已释放 ${d.heapprofd.totalFreedMB} MB &middot;
+        驻留 <strong style="color:var(--accent)">${d.heapprofd.totalResidentMB} MB</strong> &middot;
+        ${d.heapprofd.snapshotCount} 快照
+      </div>
+      <div class="card-help" id="help-heapprofd"></div>
+      <div id="heapprofd-cat-breakdown"></div>
+      <div class="table-wrap" id="table-heapprofd"></div>
+    </div>` : ''}
+
+    <div class="card">
+      <div class="card-title">归因明细 <button class="help-toggle" onclick="toggleHelp(this)" title="了解此图表">i</button></div>
+      <div class="card-help" id="help-detail"></div>
+      <div id="attribution-detail"></div>
+    </div>
+    <div class="doc-modal-overlay" id="doc-modal-overlay" onclick="if(event.target===this)closeDocModal()">
+      <div class="doc-modal" id="doc-modal-content"></div>
+    </div>
+  `;
+
+  renderHelpBlocks();
+  renderIcicle(d, attr);
+  renderPieAndTable(attr);
+  renderDumpsysBars(d.dumpsysRaw);
+  if (d.heapprofd) renderHeapprofdTable(d.heapprofd);
+  renderAttributionDetail(d);
+}
+
+/* ── Icicle Chart (CSS) ──────────────────────────── */
+function renderIcicle(d, attr) {
+  const el = document.getElementById('icicle-chart');
+  const total = d.totalPssMB;
+  const cats = CATEGORY_ORDER.filter(c => attr[c] && attr[c].pssMB >= 0.5);
+
+  let html = `<div class="icicle-total"><strong>${total} MB</strong> Total PSS</div>`;
+
+  // Level 1: all categories
+  html += '<div class="icicle-row">';
+  for (const cat of cats) {
+    const a = attr[cat];
+    const pct = (a.pssMB / total * 100);
+    const color = CATEGORY_COLORS[cat];
+    const label = pct > 5 ? `${cat}: ${a.pssMB} MB` : (pct > 2.5 ? shortenLabel(cat) : '');
+    html += `<div class="icicle-seg" style="width:${pct}%;background:${color}" title="${cat}: ${a.pssMB} MB (${a.pct}%)">
+      <span class="seg-label">${label}</span>
+      <div class="icicle-tooltip">${cat}: ${a.pssMB} MB (${a.pct}%)<br><span style="font-family:var(--font-ui);font-size:11px;opacity:.8">${CATEGORY_TIPS[cat]||''}</span></div>
+    </div>`;
+  }
+  html += '</div>';
+
+  el.innerHTML = html;
+}
+
+function shortenLabel(s) {
+  if (s.length <= 8) return s;
+  return s.substring(0, 7) + '..';
+}
+
+/* ── Pie + Table ─────────────────────────────────── */
+function renderPieAndTable(attr) {
+  const cats = CATEGORY_ORDER.filter(c => attr[c] && attr[c].pssMB >= 0.5);
+  const labels = cats.map(c => c);
+  const data = cats.map(c => attr[c].pssMB);
+  const colors = cats.map(c => CATEGORY_COLORS[c]);
+
+  destroyChart('chart-pie');
+  chartInstances['chart-pie'] = new Chart(document.getElementById('chart-pie'), {
+    type: 'pie',
+    data: { labels, datasets: [{ data, backgroundColor: colors, borderColor: '#fff', borderWidth: 2 }] },
+    options: {
+      responsive: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: { label: ctx => ` ${ctx.label}: ${ctx.raw} MB (${attr[ctx.label].pct}%)` },
+          bodyFont: { family: "'JetBrains Mono'", size: 12 },
+        },
+      },
+    },
+    plugins: [{
+      id: 'outerLabels',
+      afterDraw(chart) {
+        const { ctx, chartArea } = chart;
+        const meta = chart.getDatasetMeta(0);
+        if (!meta || !meta.data) return;
+        ctx.save();
+        meta.data.forEach((arc, i) => {
+          if (data[i] / memoryData.totalPssMB < 0.025) return;
+          const { x, y } = arc.tooltipPosition();
+          const angle = (arc.startAngle + arc.endAngle) / 2;
+          const r = arc.outerRadius + 18;
+          const cx = arc.x + Math.cos(angle) * r;
+          const cy = arc.y + Math.sin(angle) * r;
+          ctx.textAlign = Math.cos(angle) > 0 ? 'left' : 'right';
+          ctx.textBaseline = 'middle';
+          ctx.font = "500 11px 'Noto Sans SC'";
+          ctx.fillStyle = '#5a6577';
+          ctx.fillText(`${labels[i]}: ${attr[labels[i]].pct}%`, cx, cy);
+        });
+        ctx.restore();
+      }
+    }],
+  });
+
+  // Table
+  const container = document.getElementById('table-attribution');
+  let html = '<table><thead><tr><th></th><th>分类</th><th class="num">PSS (MB)</th><th class="num">占比</th><th>来源</th></tr></thead><tbody>';
+  for (const cat of cats) {
+    const a = attr[cat];
+    html += `<tr>
+      <td><span class="cat-dot" style="background:${CATEGORY_COLORS[cat]}"></span></td>
+      <td style="font-weight:500"><span class="cat-tip doc-link" data-tip="${esc(CATEGORY_TIPS[cat]||'')}" onclick="showDocModal('${esc(cat)}')">${esc(cat)}</span></td>
+      <td class="num">${a.pssMB}</td>
+      <td class="num">${a.pct}%</td>
+      <td style="font-size:11px;color:var(--text-muted)">${esc(a.source||'')}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+/* ── Dumpsys Bars (CSS) ──────────────────────────── */
+const DUMPSYS_TIPS = {
+  'Native Heap': '系统 malloc 分配的原生堆（Unity 引擎 + Lua VM + 业务 native 混合）',
+  'Dalvik Heap': 'Java/Kotlin 对象堆（ART GC 管理）',
+  'Dalvik Other': 'ART 运行时内部结构（class 表、JIT 代码缓存、method 缓存）',
+  'Stack': '所有线程的栈内存',
+  'GL mtrack': 'OpenGL 驱动分配的 GPU 纹理/Buffer（Adreno/Mali）',
+  'EGL mtrack': 'EGL surface 内存（窗口系统缓冲）',
+  'GPU': 'Vulkan 或新版驱动 GPU 内存计数器',
+  'Gfx dev': '图形设备节点映射（/dev/kgsl-3d0 等）',
+  'Ashmem': 'Android 匿名共享内存（SurfaceFlinger buffer、GraphicBuffer）',
+  'Other dev': '其他 /dev/ 设备映射',
+  '.so mmap': '共享库代码段（libunity.so、libil2cpp.so 等可执行代码）',
+  '.dex mmap': 'DEX 字节码文件映射',
+  '.oat mmap': 'ART AOT 预编译产物映射',
+  '.apk mmap': 'APK 文件映射（资源、assets）',
+  '.jar mmap': 'JAR 文件映射',
+  '.art mmap': 'ART boot image 映射（预编译 framework 类）',
+  'Other mmap': '匿名共享/mmap 区域（无法进一步归类）',
+  'Unknown': 'dumpsys 无法分类的匿名 mmap 区域（含 Unity MemoryMap、Lua VM 等）',
+};
+const DUMPSYS_MAPS = {
+  'Native Heap': 'Unity Native + Lua VM + App Native',
+  'Dalvik Heap': 'Java/Runtime', 'Dalvik Other': 'Java/Runtime',
+  'Stack': 'Java/Runtime', '.art mmap': 'Java/Runtime',
+  'GL mtrack': 'Graphics', 'EGL mtrack': 'Graphics', 'GPU': 'Graphics',
+  'Gfx dev': 'Graphics', 'Ashmem': 'Graphics', 'Other dev': 'Graphics',
+  '.so mmap': 'Code', '.dex mmap': 'Code', '.oat mmap': 'Code',
+  '.apk mmap': 'Code', '.jar mmap': 'Code',
+  'Other mmap': 'Unknown', 'Unknown': 'Unity Native + Managed + Lua VM + Unknown',
+};
+
+const DUMPSYS_DOCS = {
+  'Native Heap': {
+    category: 'Unity Native + Lua VM + App Native', color: '#e67e22',
+    desc: '系统 malloc/mmap 分配的原生堆内存，包含多个来源的混合分配。',
+    includes: ['Unity 引擎 C++ 对象（il2cpp 运行时分配）', 'Lua VM allocator 内存（tolua 自定义分配器）', '业务 native 插件 C/C++ 分配', '系统分配器元数据和对齐开销'],
+    calc: 'dumpsys meminfo "Native Heap" 行 PSS 值。需通过 heapprofd 函数级采样进一步拆分归因到 Unity Native / Lua VM / App Native。',
+    notes: '该值是混合池，无法直接归入单一分类。heapprofd 可将其中 il2cpp*→Unity Native、lua_*→Lua VM、业务函数→App Native 进行拆分。无 heapprofd 时，此值大部分归入 Unknown。',
+  },
+  'Dalvik Heap': {
+    category: 'Java/Runtime', color: '#1abc9c',
+    desc: 'Android ART 虚拟机管理的 Java/Kotlin 对象堆。',
+    includes: ['Java/Kotlin 对象实例', 'String、Array、Collection 等标准库对象', 'Android SDK 及业务 Java 代码创建的对象'],
+    calc: 'dumpsys meminfo "Dalvik Heap" 行 PSS 值。',
+    notes: 'Unity 游戏的 Java 堆通常较小（< 30 MB），主要来自 Android Activity、SDK 和系统组件。C# 托管堆在 Unity Managed 中单独计量。',
+  },
+  'Dalvik Other': {
+    category: 'Java/Runtime', color: '#1abc9c',
+    desc: 'ART 运行时内部数据结构，非 Java 对象堆。',
+    includes: ['Class 表和方法缓存', 'JIT 编译代码缓存', 'GC 内部数据结构（bitmap、mark stack）', 'LinearAlloc（类加载器的线性分配）'],
+    calc: 'dumpsys meminfo "Dalvik Other" 行 PSS 值。',
+    notes: '该值通常稳定，与加载的类数量正相关。异常增长可能表示动态类加载过多或 ClassLoader 泄漏。',
+  },
+  'Stack': {
+    category: 'Java/Runtime', color: '#1abc9c',
+    desc: '所有线程（Java + native）的栈内存。',
+    includes: ['Java 线程栈（默认每线程 1 MB）', 'Native 线程栈（pthread 创建）', '主线程、渲染线程、Unity 工作线程等'],
+    calc: 'dumpsys meminfo "Stack" 行 PSS 值。',
+    notes: '线程数 × 栈大小。Unity 游戏常有 30-60 个线程。线程过多是常见的内存浪费来源（每个线程即使空闲也占栈内存）。',
+  },
+  'GL mtrack': {
+    category: 'Graphics', color: '#e74c3c',
+    desc: 'OpenGL 驱动分配的 GPU 纹理和 Buffer 内存。',
+    includes: ['GPU 端纹理（Texture2D、RenderTexture 的 GPU 副本）', 'GPU Buffer（VBO、IBO、UBO）', 'Adreno/Mali 驱动内部缓存和状态'],
+    calc: 'dumpsys meminfo "GL mtrack" 行 PSS 值。该值由 GPU 驱动报告，通过 /proc/kgsl 或 GPU debugfs 获取。',
+    notes: 'PowerVR 等部分 GPU 不暴露此计数器（值为 0）。此时 Graphics 分类回退到 Unity totalGfxMemoryMB（引擎会计值）。这是 Graphics 分类中通常最大的组成部分。',
+  },
+  'EGL mtrack': {
+    category: 'Graphics', color: '#e74c3c',
+    desc: 'EGL surface 内存，窗口系统的图形缓冲。',
+    includes: ['EGL window surface 缓冲（通常 triple buffering = 3 帧）', 'EGL pbuffer surface', 'EGL 上下文关联的内部状态'],
+    calc: 'dumpsys meminfo "EGL mtrack" 行 PSS 值。',
+    notes: '与屏幕分辨率和 buffer 数量直接相关。高分辨率设备的 EGL surface 更大。',
+  },
+  'GPU': {
+    category: 'Graphics', color: '#e74c3c',
+    desc: 'Vulkan 或新版驱动的 GPU 内存计数器。',
+    includes: ['Vulkan 分配的 GPU 内存', '新版 Mali/Adreno 驱动的统一 GPU 计数器', 'Pipeline cache、descriptor pool 等'],
+    calc: 'dumpsys meminfo "GPU" 行 PSS 值。',
+    notes: '部分设备可能将 GPU 内存同时报告在 GL mtrack 和 GPU 中，但 dumpsys 保证不重复计数。旧版驱动此值为 0。',
+  },
+  'Gfx dev': {
+    category: 'Graphics', color: '#e74c3c',
+    desc: '图形设备节点的映射内存。',
+    includes: ['/dev/kgsl-3d0（Adreno GPU 设备节点）', '/dev/mali0（Mali GPU 设备节点）', '其他图形设备的 mmap 区域'],
+    calc: 'dumpsys meminfo "Gfx dev" 行 PSS 值。',
+    notes: '包含 GPU 驱动通过设备节点映射到用户空间的共享内存。通常较小。',
+  },
+  'Ashmem': {
+    category: 'Graphics', color: '#e74c3c',
+    desc: 'Android 匿名共享内存，用于跨进程的图形缓冲。',
+    includes: ['GraphicBuffer（SurfaceFlinger 与 App 之间的图形缓冲）', 'gralloc 分配的硬件合成缓冲', '其他匿名共享内存区域'],
+    calc: 'dumpsys meminfo "Ashmem" 行 PSS 值（按共享进程数均分）。',
+    notes: '该内存由多个进程共享，PSS 值是按映射进程数等分后的份额。实际物理内存可能更大。',
+  },
+  'Other dev': {
+    category: 'Graphics', color: '#e74c3c',
+    desc: '其他 /dev/ 设备节点的映射内存。',
+    includes: ['非图形设备节点的 mmap 区域', '传感器、相机等设备映射', '自定义硬件驱动的共享内存'],
+    calc: 'dumpsys meminfo "Other dev" 行 PSS 值。',
+    notes: '通常值很小。异常增大可能表示某个硬件驱动的内存泄漏。',
+  },
+  '.so mmap': {
+    category: 'Code', color: '#3498db',
+    desc: '所有共享库（.so 文件）的可执行代码段映射。',
+    includes: ['libunity.so（Unity 引擎核心）', 'libil2cpp.so（IL2CPP 编译的 C# 代码）', 'libtolua.so（Lua 桥接库）', '第三方 SDK 的 .so 文件代码段', '系统共享库'],
+    calc: 'dumpsys meminfo ".so mmap" 行 PSS 值。PSS = 共享页按映射进程数等分。',
+    notes: '这是只读的可执行代码段（r-xp 权限），被多个进程共享。PSS 值通常远小于实际文件大小。第三方 SDK 的数据段（rw-p）不计入此项，而归入 Third-party 分类。',
+  },
+  '.dex mmap': {
+    category: 'Code', color: '#3498db',
+    desc: 'DEX 字节码文件映射。',
+    includes: ['APK 中的 classes.dex 映射', '热更新或动态加载的 dex 文件', 'multidex 的多个 dex 文件'],
+    calc: 'dumpsys meminfo ".dex mmap" 行 PSS 值。',
+    notes: 'ART 运行时通过 mmap 映射 dex 文件用于解释执行和 JIT 编译。对 Unity 游戏通常较小（主要代码在 .so 中）。',
+  },
+  '.oat mmap': {
+    category: 'Code', color: '#3498db',
+    desc: 'ART AOT 编译产物映射。',
+    includes: ['boot.oat（系统 framework 预编译代码）', '应用级 AOT 编译的 oat 文件', 'vdex 文件（verified dex 缓存）'],
+    calc: 'dumpsys meminfo ".oat mmap" 行 PSS 值。',
+    notes: '由 dex2oat 生成，是 Java 代码的提前编译结果。首次安装或系统更新后会重新生成。',
+  },
+  '.apk mmap': {
+    category: 'Code', color: '#3498db',
+    desc: 'APK 包文件的映射内存。',
+    includes: ['APK 中的资源文件映射（resources.arsc）', 'assets 目录内容映射', '未压缩的原始资源直接映射'],
+    calc: 'dumpsys meminfo ".apk mmap" 行 PSS 值。',
+    notes: 'Android 的 APK 文件可以被直接 mmap 到进程地址空间，减少解压开销。Unity 游戏的 StreamingAssets 可能通过此方式访问。',
+  },
+  '.jar mmap': {
+    category: 'Code', color: '#3498db',
+    desc: 'JAR 文件映射。',
+    includes: ['framework JAR 文件映射', '系统服务的 JAR 映射'],
+    calc: 'dumpsys meminfo ".jar mmap" 行 PSS 值。',
+    notes: '通常值很小，来自 Android 系统 framework。',
+  },
+  '.art mmap': {
+    category: 'Java/Runtime', color: '#1abc9c',
+    desc: 'ART boot image 映射，包含预编译的 framework 类。',
+    includes: ['boot.art（预初始化的系统类对象）', 'boot image 中的 String 常量池', '系统 framework 的预分配对象图'],
+    calc: 'dumpsys meminfo ".art mmap" 行 PSS 值。',
+    notes: 'boot image 在所有 App 间共享，PSS 按进程数均分后通常较小。包含系统启动时预加载的类和对象。',
+  },
+  'Other mmap': {
+    category: 'Unknown', color: '#95a5a6',
+    desc: '匿名共享内存和其他 mmap 映射区域。',
+    includes: ['匿名 mmap 区域（非文件映射）', 'tmpfs 映射', '其他不属于已知分类的映射'],
+    calc: 'dumpsys meminfo "Other mmap" 行 PSS 值。',
+    notes: '该值直接计入 Unknown 分类。内容不透明，可能包含 JNI NewDirectByteBuffer、共享内存通信区域等。',
+  },
+  'Unknown': {
+    category: 'Unity Native + Managed + Lua VM + Unknown', color: '#95a5a6',
+    desc: 'dumpsys 无法分类的匿名 mmap 区域。这是最大的待拆分池。',
+    includes: ['Unity 引擎 MemoryMap Native 区域（引擎 allocator 的 mmap）', 'Unity Managed 堆（GC heap 的 mmap）', 'Lua VM allocator 的 mmap 区域', '其他匿名 mmap（JNI 分配、驱动映射等）'],
+    calc: 'dumpsys meminfo "Unknown" 行 PSS 值。该值通过 Unity MemoryMap 数据拆分：\n• MemoryMap Native Resident → Unity Native\n• MemoryMap Managed Resident → Unity Managed\n• luaMemoryKB (lua_gc) → Lua VM\n• 剩余 → Unknown',
+    notes: '无 Unity MemoryProfiler 数据时（Mode B），此值无法拆分，全部归入 Unknown。这是三工具协作最核心的价值所在——将 dumpsys 的一个大黑盒拆解为有意义的引擎分类。',
+  },
+};
+
+function renderDumpsysBars(raw) {
+  if (!raw) return;
+  const el = document.getElementById('dumpsys-bars');
+  const sorted = Object.entries(raw).filter(([,v]) => v >= 1024).sort((a,b) => b[1]-a[1]);
+  const maxVal = sorted[0]?.[1] || 1;
+  const colors = ['#3498db','#e74c3c','#e67e22','#27ae60','#9b59b6','#1abc9c','#f39c12','#34495e','#e91e63','#00bcd4','#795548','#607d8b','#ff5722','#4caf50','#673ab7'];
+
+  let html = '<div class="phase-bar-wrap">';
+  sorted.forEach(([name, val], i) => {
+    const mb = (val / 1024).toFixed(1);
+    const pct = Math.max(2, val / maxVal * 100);
+    const color = colors[i % colors.length];
+    const tip = DUMPSYS_TIPS[name] || '';
+    const maps = DUMPSYS_MAPS[name] || '';
+    const desc = tip + (maps ? `\n→ 归入: ${maps}` : '');
+    html += `<div class="phase-bar-row">
+      <div class="phase-bar-label"><span class="cat-tip doc-link" data-tip="${esc(desc)}" onclick="showDocModal('${esc(name)}')">${esc(name)}</span></div>
+      <div class="phase-bar-track"><div class="phase-bar-fill" style="width:${pct}%;background:${color}">${pct > 15 ? mb : ''}</div></div>
+      <div class="phase-bar-value">${mb} MB</div>
+    </div>`;
+  });
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+/* ── Heapprofd Table ─────────────────────────────── */
+function renderHeapprofdTable(hp) {
+  const catColors = {'Unity Native':'#e67e22','Lua VM':'#9b59b6','App Native':'#d35400','System/Native':'#95a5a6'};
+  // Category breakdown
+  const catEl = document.getElementById('heapprofd-cat-breakdown');
+  const catBd = hp.categoryBreakdown;
+  if (catEl && catBd && catBd.length > 0) {
+    const MAPS_TO = {
+      'Unity Native': '→ Unity Native (il2cpp malloc, Untracked 区, 叠加到 MemoryMap)',
+      'Lua VM': '不计入归因 (lua_gc 已完整计量, 此为采样交叉验证)',
+      'App Native': '→ App Native (新增归因, Untracked 区)',
+      'System/Native': '→ Unity Native (系统分配器开销, 叠加到 MemoryMap)',
+    };
+    const totalCat = catBd.reduce((s,c) => s + c.residentMB, 0);
+    let html = '<div style="margin-bottom:16px">';
+    html += '<div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:8px">分类汇总 — heapprofd 函数归因映射</div>';
+    // Stacked bar
+    html += '<div style="display:flex;height:24px;border-radius:4px;overflow:hidden;margin-bottom:8px">';
+    for (const c of catBd) {
+      const pct = totalCat > 0 ? (c.residentMB / totalCat * 100) : 0;
+      if (pct < 1) continue;
+      const color = catColors[c.category] || '#bbb';
+      html += `<div style="width:${pct}%;background:${color};display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;font-weight:600;min-width:30px" title="${esc(c.category)}: ${c.residentMB} MB">${pct >= 8 ? c.residentMB + ' MB' : ''}</div>`;
+    }
+    html += '</div>';
+    // Table
+    html += '<table style="font-size:12px"><thead><tr><th></th><th>分类</th><th class="num">驻留 (MB)</th><th class="num">占比</th><th>归因映射</th></tr></thead><tbody>';
+    for (const c of catBd) {
+      const color = catColors[c.category] || '#bbb';
+      const mapsTo = MAPS_TO[c.category] || '';
+      html += `<tr><td><span class="cat-dot" style="background:${color}"></span></td><td>${esc(c.category)}</td><td class="num">${c.residentMB}</td><td class="num">${c.pct}%</td><td style="font-size:11px;color:var(--text-muted)">${esc(mapsTo)}</td></tr>`;
+    }
+    html += `<tr style="font-weight:600;border-top:1px solid var(--border)"><td></td><td>合计</td><td class="num">${totalCat.toFixed(1)}</td><td class="num">100%</td><td style="font-size:11px;color:var(--text-muted)">heapprofd 采样总量 (≤ dumpsys Native Heap)</td></tr>`;
+    html += '</tbody></table></div>';
+    catEl.innerHTML = html;
+  }
+
+  // Function table
+  const container = document.getElementById('table-heapprofd');
+  const sig = hp.functions.filter(f => f.residentMB >= 1);
+  const skipped = hp.functions.length - sig.length;
+  const maxR = Math.max(...sig.map(f => f.residentMB));
+  const cols = [{key:'#',label:'#',num:true},{key:'function',label:'函数',code:true},{key:'category',label:'分类'},{key:'allocMB',label:'分配 (MB)',num:true},{key:'freedMB',label:'释放 (MB)',num:true},{key:'residentMB',label:'驻留 (MB)',num:true},{key:'pct',label:'占比',num:true}];
+  const rows = sig.map((f,i) => ({'#':i+1,function:f.function,category:`<span class="cat-dot" style="background:${catColors[f.category]||'#bbb'}"></span>${esc(f.category||'')}`,allocMB:f.allocMB,freedMB:f.freedMB,residentMB:f.residentMB,pct:f.pct+'%',_highlight:f.residentMB>=5,_bar:{col:'residentMB',val:f.residentMB,max:maxR,color:'#e67e22'}}));
+  buildSortableTable(container, cols, rows, 'residentMB', 'desc');
+  if (skipped > 0) container.insertAdjacentHTML('beforeend', `<div class="skip-note">已省略 ${skipped} 个驻留 &lt; 1 MB 的函数</div>`);
+}
+
+/* ── Unknown Bars ────────────────────────────────── */
+function renderUnknownBars(d) {
+  const el = document.getElementById('unknown-bars');
+  let items = [];
+  if (unknownData && unknownData.unknownBreakdown) {
+    const bd = unknownData.unknownBreakdown;
+    items = Object.entries(bd).map(([k,v]) => [k, v.pssMB || 0]);
+  } else if (d.unknownBreakdown) {
+    const ub = d.unknownBreakdown;
+    if (ub.appNativeGapKB > 0) items.push(['App Native Gap', +(ub.appNativeGapKB/1024).toFixed(1)]);
+    if (ub.otherMmapKB > 0) items.push(['Other mmap', +(ub.otherMmapKB/1024).toFixed(1)]);
+    if (ub.residualKB > 0) items.push(['Unresolved Residual', +(ub.residualKB/1024).toFixed(1)]);
+  }
+  if (items.length === 0) { el.innerHTML = '<div class="skip-note">暂无数据</div>'; return; }
+
+  items.sort((a,b) => b[1]-a[1]);
+  const maxVal = items[0][1] || 1;
+  const colors = ['#95a5a6','#7f8c8d','#bdc3c7','#aab7b8'];
+  let html = '<div class="phase-bar-wrap">';
+  items.forEach(([name, val], i) => {
+    const pct = Math.max(2, val / maxVal * 100);
+    html += `<div class="phase-bar-row">
+      <div class="phase-bar-label">${esc(name)}</div>
+      <div class="phase-bar-track"><div class="phase-bar-fill" style="width:${pct}%;background:${colors[i%colors.length]}">${pct > 15 ? val : ''}</div></div>
+      <div class="phase-bar-value">${val} MB</div>
+    </div>`;
+  });
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+/* ── Attribution Detail ──────────────────────────── */
+function renderAttributionDetail(d) {
+  const container = document.getElementById('attribution-detail');
+  const attr = d.attribution || {}, detail = d.attributionDetail || {};
+  let html = '';
+  for (const cat of CATEGORY_ORDER) {
+    if (!attr[cat]) continue;
+    const a = attr[cat], color = CATEGORY_COLORS[cat];
+    const catId = 'detail-' + cat.replace(/[^a-zA-Z]/g, '');
+    html += `<div class="accordion">
+      <div class="accordion-header" onclick="toggleAccordion(this)" style="border-left:3px solid ${color}">
+        <span class="accordion-arrow">\u25B6</span>
+        <span class="accordion-label"><span class="cat-dot" style="background:${color}"></span><span class="cat-tip doc-link" data-tip="${esc(CATEGORY_TIPS[cat]||'')}" onclick="event.stopPropagation();showDocModal('${esc(cat)}')">${esc(cat)}</span></span>
+        <span class="accordion-value" style="color:${color}">${a.pssMB} MB (${a.pct}%)</span>
+      </div>
+      <div class="accordion-body">
+        <div style="margin-bottom:10px;color:var(--text-muted);font-size:11px">来源: ${esc(a.source||'N/A')}</div>
+        <div id="${catId}"></div>
+      </div>
+    </div>`;
+  }
+  container.innerHTML = html;
+
+  // Render each category's detail content
+  for (const cat of CATEGORY_ORDER) {
+    if (!attr[cat]) continue;
+    const catId = 'detail-' + cat.replace(/[^a-zA-Z]/g, '');
+    const el = document.getElementById(catId);
+    if (!el) continue;
+    renderCategoryDetail(el, cat, detail[cat] || {}, CATEGORY_COLORS[cat]);
+  }
+}
+
+function renderCompositionSummary(jsonDetail) {
+  const items = [];
+  const labels = {
+    memoryMapResidentMB: 'MemoryMap Native Resident',
+    il2cppMallocMB: 'Unity 引擎 malloc (heapprofd: il2cpp + com.unity3d)',
+    systemNativeMB: 'System/Native (heapprofd)',
+  };
+  for (const [key, label] of Object.entries(labels)) {
+    const val = jsonDetail[key];
+    if (val && val > 0) items.push({ label, mb: val });
+  }
+  if (items.length < 2) return '';
+  const total = items.reduce((s, it) => s + it.mb, 0);
+  const barColors = ['#e67e22', '#d35400', '#95a5a6'];
+  let html = '<div style="margin-bottom:16px">';
+  html += '<div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:8px">构成明细</div>';
+  html += '<div style="display:flex;height:22px;border-radius:4px;overflow:hidden;margin-bottom:8px">';
+  items.forEach((it, i) => {
+    const pct = total > 0 ? (it.mb / total * 100) : 0;
+    html += `<div style="width:${pct}%;background:${barColors[i]};display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;font-weight:600;min-width:30px" title="${esc(it.label)}: ${it.mb} MB">${pct >= 15 ? it.mb + ' MB' : ''}</div>`;
+  });
+  html += '</div>';
+  html += '<table style="font-size:12px"><thead><tr><th></th><th>子项</th><th class="num">MB</th><th class="num">占比</th></tr></thead><tbody>';
+  items.forEach((it, i) => {
+    const pct = total > 0 ? (it.mb / total * 100).toFixed(1) : '0';
+    html += `<tr><td><span class="cat-dot" style="background:${barColors[i]}"></span></td><td>${esc(it.label)}</td><td class="num">${it.mb}</td><td class="num">${pct}%</td></tr>`;
+  });
+  html += `<tr style="font-weight:600;border-top:1px solid var(--border)"><td></td><td>合计</td><td class="num">${total.toFixed(1)}</td><td class="num">100%</td></tr>`;
+  html += '</tbody></table></div>';
+  return html;
+}
+
+function renderCategoryDetail(container, catName, jsonDetail, baseColor) {
+  const tables = detailedData ? detailedData[catName] : null;
+
+  if (tables && tables.length > 0) {
+    let html = renderCompositionSummary(jsonDetail);
+    const pieJobs = [];
+    for (let ti = 0; ti < tables.length; ti++) {
+      const tbl = tables[ti];
+      const mbColIdx = findSizeColumn(tbl.headers);
+      const hasPie = mbColIdx >= 0 && tbl.rows.length >= 2;
+      const pieId = `pie-detail-${pieCounter++}`;
+
+      html += `<div style="margin-bottom:20px">`;
+      if (tbl.title) html += `<div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:8px">${esc(tbl.title)}</div>`;
+
+      if (hasPie) {
+        html += `<div class="grid-pie">
+          <div style="display:flex;align-items:center;justify-content:center;padding:10px 0">
+            <canvas id="${pieId}" width="260" height="260"></canvas>
+          </div>
+          <div class="table-wrap">${buildDetailTable(tbl, mbColIdx, baseColor)}</div>
+        </div>`;
+        pieJobs.push({ canvasId: pieId, tblIdx: ti, mbColIdx });
+      } else {
+        html += `<div class="table-wrap">${buildDetailTable(tbl, -1, baseColor)}</div>`;
+      }
+      html += '</div>';
+    }
+    container.innerHTML = html;
+
+    // Store pie jobs for lazy rendering on accordion open
+    container._pieJobs = pieJobs;
+    container._tables = tables;
+    container._baseColor = baseColor;
+  } else {
+    // Fallback to JSON attributionDetail
+    const det = jsonDetail;
+    const hasObj = Object.values(det).some(v => typeof v === 'object' && v.pssMB !== undefined);
+    let html = '';
+    if (Object.keys(det).length > 0) {
+      if (hasObj) {
+        html += '<table><thead><tr><th>子项</th><th class="num">PSS (MB)</th></tr></thead><tbody>';
+        for (const [name, vals] of Object.entries(det)) {
+          if (typeof vals === 'object' && vals.pssMB !== undefined)
+            html += `<tr><td>${esc(name)}</td><td class="num">${vals.pssMB}</td></tr>`;
+        }
+        html += '</tbody></table>';
+      } else {
+        html += '<table><thead><tr><th>指标</th><th class="num">MB</th></tr></thead><tbody>';
+        for (const [k,v] of Object.entries(det)) html += `<tr><td>${esc(k)}</td><td class="num">${v}</td></tr>`;
+        html += '</tbody></table>';
+      }
+    } else { html = '<div style="color:var(--text-muted);font-size:12px">暂无详细数据</div>'; }
+    container.innerHTML = html;
+  }
+}
+
+function findSizeColumn(headers) {
+  // Prefer columns with "MB" in name, skip "#", "Count", "Reserved"
+  for (let i = headers.length - 1; i >= 0; i--) {
+    const h = headers[i].toLowerCase();
+    if (h.includes('reserved') || h === '#' || h.includes('count')) continue;
+    if (h.includes('(mb)') || h.includes('mb')) return i;
+  }
+  return -1;
+}
+
+function buildDetailTable(tbl, sizeColIdx, baseColor) {
+  const pieColors = generatePieColors(tbl.rows.length, baseColor);
+  let maxVal = 0;
+  if (sizeColIdx >= 0) {
+    for (const row of tbl.rows) {
+      const v = parseFloat(row[sizeColIdx]) || 0;
+      if (v > maxVal) maxVal = v;
+    }
+  }
+
+  let h = '<table><thead><tr>';
+  // Add dot column if pie
+  if (sizeColIdx >= 0) h += '<th style="width:20px"></th>';
+  for (const hdr of tbl.headers) {
+    const isNum = hdr.includes('(MB)') || hdr.includes('MB') || hdr === '#' || hdr.includes('Count') || hdr.includes('PSS');
+    h += `<th class="${isNum ? 'num' : ''}">${esc(hdr)}</th>`;
+  }
+  h += '</tr></thead><tbody>';
+  tbl.rows.forEach((row, ri) => {
+    h += '<tr>';
+    if (sizeColIdx >= 0) h += `<td><span class="cat-dot" style="background:${pieColors[ri]}"></span></td>`;
+    row.forEach((cell, ci) => {
+      const hdr = tbl.headers[ci] || '';
+      const isNum = hdr.includes('(MB)') || hdr.includes('MB') || hdr === '#' || hdr.includes('Count') || hdr.includes('PSS');
+      let content = esc(cell);
+      // Inline bar for size column
+      if (ci === sizeColIdx && maxVal > 0) {
+        const v = parseFloat(cell) || 0;
+        const pct = Math.min(100, v / maxVal * 100);
+        content += `<span class="inline-bar" style="width:${pct}%;max-width:60px;background:${pieColors[ri]}55"></span>`;
+      }
+      h += `<td class="${isNum ? 'num' : (ci === 1 ? 'code' : '')}">${content}</td>`;
+    });
+    h += '</tr>';
+  });
+  h += '</tbody></table>';
+  return h;
+}
+
+function renderDetailPie(canvas, tbl, sizeColIdx, baseColor) {
+  let labels = [], data = [];
+  const nameColIdx = tbl.headers.findIndex(h => !h.includes('(MB)') && !h.includes('MB') && h !== '#' && !h.includes('Count') && !h.includes('PSS'));
+  const nameCol = nameColIdx >= 0 ? nameColIdx : 1;
+  for (const row of tbl.rows) {
+    const val = Math.abs(parseFloat(row[sizeColIdx]) || 0);
+    if (val <= 0) continue;
+    labels.push(row[nameCol] || '');
+    data.push(val);
+  }
+  if (data.length === 0) return;
+  // Group small items into "Others" when > 6 items
+  if (data.length > 6) {
+    const total = data.reduce((s, v) => s + v, 0);
+    const threshold = total * 0.02;
+    const newLabels = [], newData = [];
+    let othersSum = 0, othersCount = 0;
+    for (let i = 0; i < data.length; i++) {
+      if (data[i] >= threshold || newData.length < 5) { newLabels.push(labels[i]); newData.push(data[i]); }
+      else { othersSum += data[i]; othersCount++; }
+    }
+    if (othersCount > 0) { newLabels.push(`Others (${othersCount})`); newData.push(+(othersSum.toFixed(2))); }
+    labels = newLabels; data = newData;
+  }
+  const colors = generatePieColors(data.length, baseColor);
+
+  destroyChart(canvas.id);
+  chartInstances[canvas.id] = new Chart(canvas, {
+    type: 'pie',
+    data: { labels, datasets: [{ data, backgroundColor: colors.slice(0, data.length), borderColor: '#fff', borderWidth: 1.5 }] },
+    options: {
+      responsive: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: { label: ctx => ` ${ctx.label}: ${ctx.raw} MB` },
+          bodyFont: { family: "'JetBrains Mono'", size: 11 },
+        },
+      },
+    },
+    plugins: [{
+      id: 'outerLabels',
+      afterDraw(chart) {
+        const { ctx } = chart;
+        const meta = chart.getDatasetMeta(0);
+        if (!meta || !meta.data) return;
+        const total = data.reduce((s, v) => s + v, 0);
+        ctx.save();
+        meta.data.forEach((arc, i) => {
+          if (data[i] / total < 0.03) return;
+          const angle = (arc.startAngle + arc.endAngle) / 2;
+          const r = arc.outerRadius + 14;
+          const cx = arc.x + Math.cos(angle) * r;
+          const cy = arc.y + Math.sin(angle) * r;
+          ctx.textAlign = Math.cos(angle) > 0 ? 'left' : 'right';
+          ctx.textBaseline = 'middle';
+          ctx.font = "11px 'Noto Sans SC'";
+          ctx.fillStyle = '#5a6577';
+          const pct = (data[i] / total * 100).toFixed(1);
+          ctx.fillText(`${labels[i]}: ${pct}%`, cx, cy);
+        });
+        ctx.restore();
+      }
+    }],
+  });
+}
+
+function generatePieColors(count, baseColor) {
+  // Generate a palette based on base color with hue rotation
+  const palette = [
+    '#3498db','#e74c3c','#e67e22','#27ae60','#9b59b6','#1abc9c','#f39c12','#34495e',
+    '#e91e63','#00bcd4','#795548','#607d8b','#ff5722','#4caf50','#673ab7','#2196f3',
+    '#ff9800','#009688','#8bc34a','#cddc39','#ff5252','#536dfe','#69f0ae','#ffd740',
+    '#448aff','#b388ff','#ea80fc','#80deea','#a5d6a7','#ffcc80'
+  ];
+  return palette.slice(0, count).concat(palette);
+}
+
+
+function toggleAccordion(el) {
+  el.classList.toggle('open');
+  const body = el.nextElementSibling;
+  body.classList.toggle('open');
+  // Lazy-render pie charts on first open
+  if (body.classList.contains('open')) {
+    const detailDiv = body.querySelector('[id^="detail-"]');
+    if (detailDiv && detailDiv._pieJobs && detailDiv._pieJobs.length > 0) {
+      setTimeout(() => {
+        for (const job of detailDiv._pieJobs) {
+          const canvas = document.getElementById(job.canvasId);
+          if (canvas && !chartInstances[job.canvasId]) {
+            renderDetailPie(canvas, detailDiv._tables[job.tblIdx], job.mbColIdx, detailDiv._baseColor);
+          }
+        }
+      }, 50);
+    }
+  }
+}
+
+/* ── Help System ─────────────────────────────────────── */
+function toggleHelp(btn) {
+  btn.classList.toggle('active');
+  const helpBlock = btn.closest('.card').querySelector('.card-help');
+  if (helpBlock) helpBlock.classList.toggle('open');
+}
+
+function renderHelpBlocks() {
+  for (const [key, content] of Object.entries(SECTION_HELP)) {
+    const el = document.getElementById('help-' + key);
+    if (!el) continue;
+    let html = '<dl>';
+    for (const item of content.lines) {
+      html += `<dt>${item.dt}</dt><dd>${item.dd}</dd>`;
+    }
+    html += '</dl>';
+    el.innerHTML = html;
+  }
+}
+
+/* ── Doc Modal ──────────────────────────────────────── */
+function showDocModal(key) {
+  const doc = DUMPSYS_DOCS[key] || CATEGORY_DOCS[key];
+  if (!doc) return;
+  const overlay = document.getElementById('doc-modal-overlay');
+  const content = document.getElementById('doc-modal-content');
+  const tagLabel = doc.category ? doc.category : key;
+  let html = `<div class="doc-modal-title"><span>${esc(key)}<span class="doc-modal-tag" style="background:${doc.color}">${esc(doc.category ? '\u2192 ' + doc.category : '')}</span></span><button class="doc-modal-close" onclick="closeDocModal()">\u00D7</button></div>`;
+  html += `<p>${esc(doc.desc)}</p>`;
+  if (doc.includes && doc.includes.length) { html += '<h4>\u5305\u542B</h4><ul>'; for (const item of doc.includes) html += `<li>${esc(item)}</li>`; html += '</ul>'; }
+  if (doc.excludes && doc.excludes.length) { html += '<h4>\u4E0D\u5305\u542B</h4><ul>'; for (const item of doc.excludes) html += `<li>${esc(item)}</li>`; html += '</ul>'; }
+  html += `<h4>\u8BA1\u7B97\u65B9\u5F0F</h4><p style="white-space:pre-line">${esc(doc.calc)}</p>`;
+  if (doc.notes) html += `<h4>\u6CE8\u610F</h4><div class="doc-note">${esc(doc.notes)}</div>`;
+  content.innerHTML = html;
+  overlay.classList.add('open');
+}
+function closeDocModal() {
+  document.getElementById('doc-modal-overlay').classList.remove('open');
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDocModal(); });
+
+/* ═══════════════════════════════════════════════════════
+   Startup Tab
+   ═══════════════════════════════════════════════════════ */
+function renderStartupTab() {
+  document.getElementById('startup-empty').style.display = 'none';
+  const c = document.getElementById('startup-content'); c.style.display = 'block';
+  const s = startupData;
+
+  c.innerHTML = `
+    <div class="card">
+      <div class="card-title">冷启动阶段瀑布图</div>
+      <div class="card-subtitle">总耗时 <strong>${s.totalSeconds}s</strong> — 各阶段时间分布</div>
+      <div id="waterfall-chart"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">阶段耗时对比</div>
+      <div class="card-subtitle">Wall Time vs Slice Time</div>
+      <div id="phase-compare"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">关键里程碑</div>
+      <div class="card-subtitle">耗时 &ge; 5ms 的重要事件</div>
+      <div class="table-wrap" id="table-milestones"></div>
+    </div>
+    ${s.sdkInit.entries.length > 0 ? `
+    <div class="card">
+      <div class="card-title">SDK & ContentProvider 初始化</div>
+      <div class="card-subtitle">bindApplication 总耗时: <strong style="color:var(--accent)">${s.sdkInit.bindDurationMs} ms</strong></div>
+      <div class="table-wrap" id="table-sdk-init"></div>
+    </div>` : ''}
+    <div class="card">
+      <div class="card-title">各阶段详情</div>
+      <div id="phase-details"></div>
+    </div>
+  `;
+
+  renderWaterfall(s);
+  renderPhaseCompare(s);
+  renderMilestonesTable(s);
+  if (s.sdkInit.entries.length > 0) renderSDKInitTable(s);
+  renderPhaseDetails(s);
+}
+
+/* ── Waterfall (CSS) ─────────────────────────────── */
+function renderWaterfall(s) {
+  if (!s.phases.length) return;
+  const el = document.getElementById('waterfall-chart');
+  const totalMs = s.totalSeconds * 1000;
+  let offset = 0;
+  const bars = s.phases.map((p, i) => {
+    const start = offset;
+    let dur = p.wallMs !== null && p.wallMs !== undefined ? p.wallMs : (i === s.phases.length - 1 ? Math.max(0, totalMs - start) : p.sliceMs / 10);
+    offset += dur;
+    return { start, dur, end: offset };
+  });
+  const maxEnd = Math.max(...bars.map(b => b.end));
+
+  let html = '<div class="waterfall">';
+  s.phases.forEach((p, i) => {
+    const b = bars[i];
+    const leftPct = b.start / maxEnd * 100;
+    const widthPct = Math.max(0.5, b.dur / maxEnd * 100);
+    html += `<div class="wf-row">
+      <div class="wf-label">P${p.phase}: ${esc(p.name)}</div>
+      <div class="wf-track">
+        <div class="wf-bar" style="left:${leftPct}%;width:${widthPct}%;background:${PHASE_COLORS[i]}">${widthPct > 8 ? fmtMs(b.dur) : ''}</div>
+      </div>
+      <div class="wf-value">${fmtMs(b.dur)}</div>
+    </div>`;
+  });
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+/* ── Phase Compare (CSS bars) ────────────────────── */
+function renderPhaseCompare(s) {
+  if (!s.phases.length) return;
+  const el = document.getElementById('phase-compare');
+  const maxWall = Math.max(...s.phases.map(p => p.wallMs || 0));
+  const maxSlice = Math.max(...s.phases.map(p => p.sliceMs || 0));
+  const maxVal = Math.max(maxWall, maxSlice);
+
+  let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">';
+
+  // Wall time
+  html += '<div><div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Wall Time</div><div class="phase-bar-wrap">';
+  s.phases.forEach((p, i) => {
+    const val = p.wallMs;
+    const pct = val !== null && val !== undefined ? Math.max(2, val / maxVal * 100) : 0;
+    html += `<div class="phase-bar-row">
+      <div class="phase-bar-label" style="width:80px">Phase ${p.phase}</div>
+      <div class="phase-bar-track"><div class="phase-bar-fill" style="width:${pct}%;background:${PHASE_COLORS[i]}">${pct > 15 && val ? fmtMs(val) : ''}</div></div>
+      <div class="phase-bar-value" style="width:70px">${val !== null && val !== undefined ? fmtMs(val) : '\u2014'}</div>
+    </div>`;
+  });
+  html += '</div></div>';
+
+  // Slice time
+  html += '<div><div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Slice Time</div><div class="phase-bar-wrap">';
+  s.phases.forEach((p, i) => {
+    const val = p.sliceMs;
+    const pct = Math.max(2, val / maxVal * 100);
+    html += `<div class="phase-bar-row">
+      <div class="phase-bar-label" style="width:80px">Phase ${p.phase}</div>
+      <div class="phase-bar-track"><div class="phase-bar-fill" style="width:${pct}%;background:${PHASE_COLORS[i]}88">${pct > 15 ? fmtMs(val) : ''}</div></div>
+      <div class="phase-bar-value" style="width:70px">${fmtMs(val)}</div>
+    </div>`;
+  });
+  html += '</div></div></div>';
+  el.innerHTML = html;
+}
+
+/* ── Milestones Table ────────────────────────────── */
+function renderMilestonesTable(s) {
+  const container = document.getElementById('table-milestones');
+  const filtered = s.milestones.filter(m => m.durationMs >= 5);
+  const maxDur = Math.max(...filtered.map(m => m.durationMs));
+  const cols = [{key:'offsetMs',label:'偏移',num:true},{key:'event',label:'事件',code:true},{key:'durationMs',label:'耗时 (ms)',num:true},{key:'thread',label:'线程'}];
+  const rows = filtered.map(m => ({offsetMs:'+'+m.offsetMs.toFixed(0)+'ms',event:m.event,durationMs:m.durationMs,thread:m.thread,_sortVals:{offsetMs:m.offsetMs,durationMs:m.durationMs},_bar:{col:'durationMs',val:m.durationMs,max:maxDur,color:'#3498db'}}));
+  buildSortableTable(container, cols, rows, 'offsetMs', 'asc');
+}
+
+/* ── SDK Init Table ──────────────────────────────── */
+function renderSDKInitTable(s) {
+  const container = document.getElementById('table-sdk-init');
+  const filtered = s.sdkInit.entries.filter(e => e.durationMs >= 5);
+  const maxDur = Math.max(...filtered.map(e => e.durationMs));
+  const cols = [{key:'rank',label:'#',num:true},{key:'name',label:'名称',code:true},{key:'durationMs',label:'耗时 (ms)',num:true},{key:'tag',label:'标签'}];
+  const rows = filtered.map((e,i) => ({rank:e.rank||(e.isChild?'':i+1),name:e.name,durationMs:e.durationMs,tag:e.tag,_isChild:e.isChild,_tagClass:TAG_CLASSES[e.tag]||'tag-other',_bar:{col:'durationMs',val:e.durationMs,max:maxDur,color:'#e67e22'}}));
+  buildSortableTable(container, cols, rows, null, null, {
+    renderCell(key,val,row) { if (key==='tag'&&val) return `<span class="tag ${row._tagClass}">${val}</span>`; return null; },
+    rowClass(row) { return row._isChild ? 'child' : ''; },
+  });
+}
+
+/* ── Phase Details ───────────────────────────────── */
+function renderPhaseDetails(s) {
+  const container = document.getElementById('phase-details');
+  let html = '';
+  for (let i = 1; i <= 4; i++) {
+    const items = s.phaseDetails[i]; if (!items || items.length === 0) continue;
+    const pi = s.phases.find(p => p.phase === i);
+    const totalMs = pi ? pi.sliceMs : 0;
+    html += `<div class="accordion">
+      <div class="accordion-header" onclick="toggleAccordion(this)" style="border-left:3px solid ${PHASE_COLORS[i-1]}">
+        <span class="accordion-arrow">\u25B6</span>
+        <span class="accordion-label">Phase ${i}: ${PHASE_NAMES[i]}</span>
+        <span class="accordion-value" style="color:${PHASE_COLORS[i-1]}">${fmtMs(totalMs)} &middot; ${items.length} 项</span>
+      </div>
+      <div class="accordion-body"><div class="table-wrap" id="phase-detail-${i}"></div></div>
+    </div>`;
+  }
+  container.innerHTML = html;
+  for (let i = 1; i <= 4; i++) {
+    const items = s.phaseDetails[i]; if (!items || items.length === 0) continue;
+    const el = document.getElementById(`phase-detail-${i}`); if (!el) continue;
+    const filtered = items.filter(it => it.totalMs >= 10);
+    const skipped = items.length - filtered.length;
+    const maxMs = Math.max(...filtered.map(it => it.totalMs));
+    const cols = [{key:'rank',label:'#',num:true},{key:'name',label:'名称',code:true},{key:'totalMs',label:'总耗时 (ms)',num:true},{key:'count',label:'次数',num:true},{key:'maxMs',label:'最大 (ms)',num:true}];
+    const rows = filtered.map((it,idx) => ({...it,rank:idx+1,_bar:{col:'totalMs',val:it.totalMs,max:maxMs,color:PHASE_COLORS[i-1]}}));
+    buildSortableTable(el, cols, rows, 'totalMs', 'desc');
+    if (skipped > 0) el.insertAdjacentHTML('beforeend', `<div class="skip-note">已省略 ${skipped} 项 &lt; 10 ms</div>`);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Sortable Table Builder
+   ═══════════════════════════════════════════════════════ */
+function buildSortableTable(container, columns, rows, defKey, defDir, opts={}) {
+  let sortKey = defKey, sortDir = defDir || 'desc';
+  function draw() {
+    const sorted = [...rows];
+    if (sortKey) {
+      sorted.sort((a,b) => {
+        let av = a._sortVals?.[sortKey] ?? a[sortKey], bv = b._sortVals?.[sortKey] ?? b[sortKey];
+        if (typeof av === 'string' && !isNaN(parseFloat(av))) av = parseFloat(av);
+        if (typeof bv === 'string' && !isNaN(parseFloat(bv))) bv = parseFloat(bv);
+        if (typeof av === 'number' && typeof bv === 'number') return sortDir === 'asc' ? av-bv : bv-av;
+        return sortDir === 'asc' ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
+      });
+    }
+    let h = '<table><thead><tr>';
+    for (const col of columns) {
+      const cls = [col.num?'num':'']; if (sortKey===col.key) cls.push(sortDir==='asc'?'sort-asc':'sort-desc');
+      h += `<th class="${cls.join(' ')}" data-key="${col.key}">${col.label}</th>`;
+    }
+    h += '</tr></thead><tbody>';
+    for (const row of sorted) {
+      const rc = [row._highlight?'highlight':'', opts.rowClass?opts.rowClass(row):''].filter(Boolean).join(' ');
+      h += `<tr class="${rc}">`;
+      for (const col of columns) {
+        const val = row[col.key]; let cell = '';
+        if (opts.renderCell) { const custom = opts.renderCell(col.key, val, row); if (custom !== null) cell = custom; }
+        if (!cell) cell = val !== null && val !== undefined ? (col.code ? esc(String(val)) : String(val)) : '';
+        if (row._bar && row._bar.col === col.key && row._bar.max > 0) {
+          const pct = Math.min(100, row._bar.val / row._bar.max * 100);
+          cell += `<span class="inline-bar" style="width:${pct}%;max-width:80px;background:${row._bar.color}44"></span>`;
+        }
+        h += `<td class="${col.num?'num':(col.code?'code':'')}">${cell}</td>`;
+      }
+      h += '</tr>';
+    }
+    h += '</tbody></table>';
+    container.innerHTML = h;
+    container.querySelectorAll('th').forEach(th => {
+      th.addEventListener('click', () => {
+        const key = th.dataset.key;
+        if (sortKey === key) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+        else { sortKey = key; sortDir = 'desc'; }
+        draw();
+      });
+    });
+  }
+  draw();
+}
+
+/* ═══════════════════════════════════════════════════════
+   Utilities
+   ═══════════════════════════════════════════════════════ */
+function destroyChart(id) { if (chartInstances[id]) { chartInstances[id].destroy(); delete chartInstances[id]; } }
+function fmtMs(ms) { if (ms===null||ms===undefined) return '\u2014'; if (ms<1000) return ms.toFixed(0)+' ms'; if (ms<60000) return (ms/1000).toFixed(1)+' s'; return (ms/60000).toFixed(1)+' min'; }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+</script>
+</body>
+</html>

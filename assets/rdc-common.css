@@ -1,0 +1,50 @@
+/* Shared design tokens for RDC analysis reports (render graph + perf report) */
+
+@font-face { font-family: 'JetBrains Mono'; font-weight: 400; src: url('JetBrainsMono-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 500; src: url('JetBrainsMono-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 600; src: url('JetBrainsMono-SemiBold.woff2') format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 700; src: url('JetBrainsMono-Bold.woff2') format('woff2'); }
+@font-face { font-family: 'DM Sans'; font-weight: 400 700; src: url('DMSans-Variable.ttf') format('truetype'); }
+
+:root {
+  --bg-deep: #080a10;
+  --bg-surface: #0d1017;
+  --bg-card: #131720;
+  --bg-elevated: #1a1f2e;
+  --border-subtle: #1e2536;
+  --border-mid: #2a3148;
+  --border-bright: #3d4663;
+  --text-primary: #e2e8f4;
+  --text-secondary: #8892a8;
+  --text-muted: #555f78;
+  --accent-cyan: #00d4ff;
+  --accent-cyan-dim: rgba(0,212,255,0.15);
+  --accent-cyan-glow: rgba(0,212,255,0.3);
+  --heat-cold: #1a8caa;
+  --heat-cool: #22b07a;
+  --heat-warm: #d4a017;
+  --heat-hot: #e85535;
+  --heat-fire: #d42550;
+  --compute-blue: #6366f1;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --font-sans: 'DM Sans', 'Inter', system-ui, sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-deep);
+  color: var(--text-primary);
+}
+
+/* Dot grid background */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: radial-gradient(circle, var(--border-subtle) 1px, transparent 1px);
+  background-size: 24px 24px;
+  pointer-events: none;
+  z-index: 0;
+}
