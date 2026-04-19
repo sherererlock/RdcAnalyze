@@ -191,3 +191,4 @@ __marimo__/
 .omc/   
 
 rdc_captures/
+.claude/settings.local.json
