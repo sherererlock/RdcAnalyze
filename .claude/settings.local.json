@@ -14,7 +14,17 @@
       "Bash(rdc-portable/rdc.bat pipeline *)",
       "Bash(rdc-portable/rdc.bat bindings *)",
       "Bash(rdc-portable/rdc.bat close *)",
-      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(f'{k}: dedup_of={v.get\\(\\\\\"dedup_of\\\\\",\\\\\"-\\\\\"\\)}  file={v[\\\\\"file\\\\\"]}'\\) for k,v in sorted\\(d.items\\(\\), key=lambda x:int\\(x[0]\\)\\)]\")"
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(f'{k}: dedup_of={v.get\\(\\\\\"dedup_of\\\\\",\\\\\"-\\\\\"\\)}  file={v[\\\\\"file\\\\\"]}'\\) for k,v in sorted\\(d.items\\(\\), key=lambda x:int\\(x[0]\\)\\)]\")",
+      "Bash(E:/workspace/GitRepository/RdcAnalyze/python/python.exe *)",
+      "Bash(E:/workspace/GitRepository/RdcAnalyze/rdc-portable/rdc.bat draws *)",
+      "Bash(E:/workspace/GitRepository/RdcAnalyze/rdc-portable/rdc.bat open *)",
+      "Bash(E:/workspace/GitRepository/RdcAnalyze/rdc-portable/rdc.bat passes *)",
+      "Bash(E:/workspace/GitRepository/RdcAnalyze/rdc-portable/rdc.bat close *)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c ' *)",
+      "Bash(python *)",
+      "Bash(rdc-portable/rdc.bat passes *)",
+      "Bash(rdc-portable/rdc.bat events *)"
     ]
   }
 }

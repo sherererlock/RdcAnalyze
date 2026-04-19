@@ -30,7 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from shared import write_json
+from shared import write_json, dedup_frames
 from rpc import run_rdc, _unwrap, Progress, ErrorCollector, MAIN_SESSION
 from workers import (
     collect_base, collect_pass_details, _get_draw_eids, _get_dispatch_eids,
@@ -140,6 +140,11 @@ def main() -> None:
         pass_details = collect_pass_details(summary, errors, session=sess)
         write_json(out_dir / "pass_details.json", pass_details)
         timings["pass_details"] = time.time() - t0
+
+        # ── Step 3.1: Frame dedup ──
+        summary, pass_details = dedup_frames(summary, pass_details)
+        write_json(out_dir / "summary.json", summary)
+        write_json(out_dir / "pass_details.json", pass_details)
 
         # ── Step 3.5: RT resource usage (for dependency graph) ──
         print("\n[Step 3.5] Collecting render target usage ...")

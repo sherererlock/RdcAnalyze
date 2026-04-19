@@ -8,6 +8,8 @@ and other functions used by both rdc_collect.py and rdc_analyze.py.
 from __future__ import annotations
 
 import json
+import re
+from collections import defaultdict
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────
@@ -141,3 +143,230 @@ def rt_bytes(target: dict) -> float:
     fmt = target.get("format", "")
     bpp = guess_bpp(fmt)
     return w * h * (bpp / 8)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Frame deduplication
+# ─────────────────────────────────────────────────────────────────────
+
+_DEDUP_THRESHOLD = 0.05
+
+
+def _within_threshold(a: int, b: int) -> bool:
+    m = max(a, b, 1)
+    return abs(a - b) / m <= _DEDUP_THRESHOLD
+
+
+def _pass_shape(pd: dict) -> tuple:
+    """Structural fingerprint independent of resource IDs."""
+    name = pd.get("name", "")
+    m = re.search(r"#\d+\s*(.*)", name)
+    qualifier = m.group(1).strip() if m else name
+
+    color_fmts = tuple(sorted(
+        (t.get("format", ""), t.get("width", 0), t.get("height", 0))
+        for t in (pd.get("color_targets") or [])
+    ))
+    dt = pd.get("depth_target") or {}
+    depth_fmt = (dt.get("format", ""), dt.get("width", 0), dt.get("height", 0)) if dt else None
+
+    return (qualifier, pd.get("draws", 0), pd.get("dispatches", 0),
+            color_fmts, depth_fmt)
+
+
+def _find_present_cut(summary: dict) -> int | None:
+    """Strategy 1: frame boundary from Present events."""
+    events = unwrap(summary.get("events"), "events")
+    if not events or not isinstance(events, list):
+        return None
+    presents = [
+        e["eid"] for e in events
+        if isinstance(e, dict) and "eid" in e
+        and "present" in e.get("name", "").lower()
+    ]
+    if len(presents) >= 2:
+        return presents[-2]
+    return None
+
+
+def _find_swapchain_cut(pass_details: list) -> int | None:
+    """Strategy 2: frame boundary from Swapchain/Backbuffer targets."""
+    sc_indices: list[int] = []
+    for i, pd in enumerate(pass_details):
+        for ct in (pd.get("color_targets") or []):
+            nm = (ct.get("name") or "").lower()
+            if "swapchain" in nm or "backbuffer" in nm:
+                sc_indices.append(i)
+                break
+    if len(sc_indices) >= 2:
+        return pass_details[sc_indices[-2]].get("end_eid", 0)
+    return None
+
+
+def _find_rt_reuse_cut(pass_details: list) -> int | None:
+    """Strategy 3: frame boundary from render target reuse + EID gap.
+
+    When the same render target ID appears in well-separated passes with
+    similar draw counts, the earlier occurrence is from a previous frame.
+    The largest EID gap near the duplicate marks the frame boundary.
+    """
+    if len(pass_details) < 4:
+        return None
+
+    rt_uses: dict[int, list[int]] = defaultdict(list)
+    for i, pd in enumerate(pass_details):
+        for ct in (pd.get("color_targets") or []):
+            if ct.get("id"):
+                rt_uses[ct["id"]].append(i)
+        dt = pd.get("depth_target")
+        if isinstance(dt, dict) and dt.get("id"):
+            rt_uses[dt["id"]].append(i)
+
+    dup_indices: set[int] = set()
+    for indices in rt_uses.values():
+        if len(indices) < 2:
+            continue
+        for j in range(len(indices) - 1):
+            ia, ib = indices[j], indices[j + 1]
+            if ib - ia < 3:
+                continue
+            pa, pb = pass_details[ia], pass_details[ib]
+            between = sum(
+                pass_details[k].get("draws", 0) for k in range(ia + 1, ib)
+            )
+            if between < 5:
+                continue
+            if _within_threshold(pa.get("draws", 0), pb.get("draws", 0)):
+                dup_indices.add(ia)
+
+    if not dup_indices:
+        return None
+
+    last_dup = max(dup_indices)
+    search_end = min(last_dup + 4, len(pass_details) - 1)
+    best_gap = 0
+    best_cut_after = None
+    for i in range(search_end):
+        end_eid = pass_details[i].get("end_eid", 0)
+        next_begin = pass_details[i + 1].get("begin_eid", 0)
+        gap = next_begin - end_eid
+        if gap > best_gap:
+            best_gap = gap
+            best_cut_after = i
+
+    if best_cut_after is None:
+        best_cut_after = last_dup
+    if best_cut_after + 1 >= len(pass_details):
+        return None
+    return pass_details[best_cut_after + 1].get("begin_eid", 0) - 1
+
+
+def _find_sequence_cut(pass_details: list) -> int | None:
+    """Strategy 4: frame boundary from structural sequence repetition."""
+    if len(pass_details) < 6:
+        return None
+
+    shapes = [_pass_shape(pd) for pd in pass_details]
+    n = len(shapes)
+
+    for length in range(n // 2, 2, -1):
+        tail = shapes[n - length:]
+        search = shapes[: n - length]
+        for start in range(len(search) - length + 1):
+            if search[start : start + length] == tail:
+                return pass_details[n - length].get("begin_eid", 0) - 1
+
+    def _fuzzy_match(a: tuple, b: tuple) -> bool:
+        if a[0] != b[0] or a[3] != b[3] or a[4] != b[4]:
+            return False
+        if not _within_threshold(a[1], b[1]):
+            return False
+        return a[2] == b[2]
+
+    for length in range(n // 2, 2, -1):
+        tail = shapes[n - length:]
+        search = shapes[: n - length]
+        for start in range(len(search) - length + 1):
+            candidate = search[start : start + length]
+            if all(_fuzzy_match(candidate[i], tail[i]) for i in range(length)):
+                return pass_details[n - length].get("begin_eid", 0) - 1
+
+    return None
+
+
+def dedup_frames(summary: dict, pass_details: list) -> tuple[dict, list]:
+    """Detect and remove duplicate frames from a multi-frame capture.
+
+    Four-strategy cascade:
+      1. Present events (vkQueuePresentKHR / IDXGISwapChain::Present)
+      2. Swapchain/Backbuffer render targets
+      3. Render target reuse + EID gap
+      4. Structural sequence matching (repeated pass shapes)
+    """
+    if not pass_details or len(pass_details) < 2:
+        return summary, pass_details
+
+    strategy = None
+    cut_eid = _find_present_cut(summary)
+    if cut_eid is not None:
+        strategy = "vkQueuePresentKHR"
+    else:
+        cut_eid = _find_swapchain_cut(pass_details)
+        if cut_eid is not None:
+            strategy = "Swapchain Image target"
+        else:
+            cut_eid = _find_rt_reuse_cut(pass_details)
+            if cut_eid is not None:
+                strategy = "RT reuse + EID gap"
+            else:
+                cut_eid = _find_sequence_cut(pass_details)
+                if cut_eid is not None:
+                    strategy = "structural sequence match"
+
+    if cut_eid is None:
+        return summary, pass_details
+
+    passes_raw = unwrap(summary.get("passes"), "passes") or []
+    kept_pd: list[dict] = []
+    kept_passes_raw: list = []
+    for i, pd in enumerate(pass_details):
+        if pd.get("begin_eid", 0) > cut_eid:
+            kept_pd.append(pd)
+            if i < len(passes_raw):
+                kept_passes_raw.append(passes_raw[i])
+
+    if not kept_pd:
+        return summary, pass_details
+
+    removed_passes = len(pass_details) - len(kept_pd)
+    if removed_passes == 0:
+        return summary, pass_details
+
+    def _filter_eid(data, key: str):
+        items = unwrap(data, key)
+        if not items or not isinstance(items, list):
+            return data
+        filtered = [x for x in items if isinstance(x, dict) and x.get("eid", 0) > cut_eid]
+        if isinstance(data, dict) and key in data:
+            return {**data, key: filtered}
+        return filtered
+
+    orig_passes = summary.get("passes")
+    if isinstance(orig_passes, dict) and "passes" in orig_passes:
+        new_passes = {**orig_passes, "passes": kept_passes_raw}
+    else:
+        new_passes = kept_passes_raw
+
+    new_summary = {**summary}
+    new_summary["passes"] = new_passes
+    new_summary["draws"] = _filter_eid(summary.get("draws"), "draws")
+    new_summary["events"] = _filter_eid(summary.get("events"), "events")
+
+    new_draws = unwrap(new_summary["draws"], "draws") or []
+    new_events = unwrap(new_summary["events"], "events") or []
+    print(f"  [Dedup] Strategy: {strategy}")
+    print(f"  [Dedup] Removed {removed_passes} old-frame passes "
+          f"(cut EID <= {cut_eid}, "
+          f"kept {len(kept_pd)} passes, {len(new_draws)} draws, {len(new_events)} events)")
+
+    return new_summary, kept_pd

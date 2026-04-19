@@ -1,0 +1,405 @@
+"""VFS tree cache for rdc-cli.
+
+Builds a static virtual filesystem skeleton from capture data and lazily
+populates per-draw subtrees (shader stages, bindings) on first access.
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any
+
+from rdc.services.query_service import (
+    _DISPATCH,
+    _DRAWCALL,
+    STAGE_MAP,
+    _build_pass_list,
+    walk_actions,
+)
+
+_ROOT_CHILDREN = [
+    "capabilities",
+    "info",
+    "stats",
+    "log",
+    "events",
+    "draws",
+    "passes",
+    "resources",
+    "textures",
+    "buffers",
+    "shaders",
+    "counters",
+    "current",
+]
+
+_DRAW_CHILDREN = [
+    "pipeline",
+    "shader",
+    "bindings",
+    "targets",
+    "postvs",
+    "cbuffer",
+    "vbuffer",
+    "ibuffer",
+    "descriptors",
+    "pixel",
+]
+_PIPELINE_CHILDREN = [
+    "summary",
+    "topology",
+    "viewport",
+    "scissor",
+    "blend",
+    "stencil",
+    "vertex-inputs",
+    "samplers",
+    "vbuffers",
+    "ibuffer",
+    "push-constants",
+    "rasterizer",
+    "depth-stencil",
+    "msaa",
+]
+_PASS_CHILDREN = ["info", "draws", "attachments"]
+_SHADER_STAGE_CHILDREN = ["disasm", "source", "reflect", "constants"]
+_SHADER_CHILDREN = ["info", "disasm", "used-by"]
+
+
+@dataclass
+class VfsNode:
+    """Single node in the virtual filesystem tree."""
+
+    name: str
+    kind: str  # "dir" | "leaf" | "leaf_bin" | "alias"
+    children: list[str] = field(default_factory=list)
+
+
+@dataclass
+class VfsTree:
+    """Virtual filesystem tree with LRU-cached draw subtrees."""
+
+    static: dict[str, VfsNode] = field(default_factory=dict)
+    pass_name_map: dict[str, str] = field(default_factory=dict)
+    pass_list: list[dict[str, Any]] = field(default_factory=list)
+    _draw_subtrees: OrderedDict[int, dict[str, list[str]]] = field(default_factory=OrderedDict)
+    _lru_capacity: int = 64
+
+    def get_draw_subtree(self, eid: int) -> dict[str, list[str]] | None:
+        """Return cached draw subtree or None, promoting on access."""
+        val = self._draw_subtrees.get(eid)
+        if val is not None:
+            self._draw_subtrees.move_to_end(eid)
+        return val
+
+    def _evict_draw_subtree(self, eid: int) -> None:
+        """Remove a draw subtree and its dynamic static nodes."""
+        subtree = self._draw_subtrees.get(eid)
+        if subtree is None:
+            return
+        for path, children in subtree.items():
+            for child in children:
+                child_path = f"{path}/{child}"
+                self.static.pop(child_path, None)
+            node = self.static.get(path)
+            if node is not None:
+                node.children = []
+        del self._draw_subtrees[eid]
+
+    def set_draw_subtree(self, eid: int, subtree: dict[str, list[str]]) -> None:
+        """Cache a draw subtree with LRU eviction."""
+        if eid in self._draw_subtrees:
+            self._draw_subtrees.move_to_end(eid)
+        elif len(self._draw_subtrees) >= self._lru_capacity:
+            oldest_eid = next(iter(self._draw_subtrees))
+            self._evict_draw_subtree(oldest_eid)
+        self._draw_subtrees[eid] = subtree
+
+
+def build_vfs_skeleton(
+    actions: list[Any],
+    resources: list[Any],
+    textures: list[Any] | None = None,
+    buffers: list[Any] | None = None,
+    sf: Any = None,
+) -> VfsTree:
+    """Build the static VFS skeleton from capture data.
+
+    Args:
+        actions: Root action list from ReplayController.
+        resources: Resource list from ReplayController.
+        textures: TextureDescription list from GetTextures().
+        buffers: BufferDescription list from GetBuffers().
+        sf: Optional StructuredFile for action name resolution.
+    """
+    tree = VfsTree()
+    flat = walk_actions(actions, sf)
+
+    draw_eids = [str(a.eid) for a in flat if a.flags & (_DRAWCALL | _DISPATCH)]
+    event_eids = [str(a.eid) for a in flat]
+    pass_list = _build_pass_list(actions, sf)
+    tree.pass_list = pass_list
+    pass_names = [p["name"] for p in pass_list]
+    resource_ids = [str(int(getattr(r, "resourceId", 0))) for r in resources]
+
+    # Root
+    tree.static["/"] = VfsNode("/", "dir", list(_ROOT_CHILDREN))
+
+    # Top-level leaves
+    for leaf in ("capabilities", "info", "stats", "log"):
+        tree.static[f"/{leaf}"] = VfsNode(leaf, "leaf")
+
+    # /events
+    tree.static["/events"] = VfsNode("events", "dir", list(event_eids))
+    for eid in event_eids:
+        tree.static[f"/events/{eid}"] = VfsNode(eid, "leaf")
+
+    # /draws
+    tree.static["/draws"] = VfsNode("draws", "dir", list(draw_eids))
+    for eid in draw_eids:
+        prefix = f"/draws/{eid}"
+        tree.static[prefix] = VfsNode(eid, "dir", list(_DRAW_CHILDREN))
+        tree.static[f"{prefix}/pipeline"] = VfsNode("pipeline", "dir", list(_PIPELINE_CHILDREN))
+        for child in _PIPELINE_CHILDREN:
+            tree.static[f"{prefix}/pipeline/{child}"] = VfsNode(child, "leaf")
+        tree.static[f"{prefix}/shader"] = VfsNode("shader", "dir")
+        tree.static[f"{prefix}/bindings"] = VfsNode("bindings", "dir")
+        tree.static[f"{prefix}/targets"] = VfsNode("targets", "dir")
+        tree.static[f"{prefix}/postvs"] = VfsNode("postvs", "leaf")
+        tree.static[f"{prefix}/cbuffer"] = VfsNode("cbuffer", "dir")
+        tree.static[f"{prefix}/vbuffer"] = VfsNode("vbuffer", "leaf")
+        tree.static[f"{prefix}/ibuffer"] = VfsNode("ibuffer", "leaf")
+        tree.static[f"{prefix}/descriptors"] = VfsNode("descriptors", "leaf")
+        tree.static[f"{prefix}/pixel"] = VfsNode("pixel", "dir")
+
+    # /passes — sanitize names containing "/" to avoid path corruption
+    safe_pass_names = [n.replace("/", "_") for n in pass_names]
+    for safe, orig in zip(safe_pass_names, pass_names, strict=True):
+        if safe != orig:
+            tree.pass_name_map[safe] = orig
+    tree.static["/passes"] = VfsNode("passes", "dir", list(safe_pass_names))
+    for p, name in zip(pass_list, safe_pass_names, strict=True):
+        prefix = f"/passes/{name}"
+        tree.static[prefix] = VfsNode(name, "dir", list(_PASS_CHILDREN))
+        tree.static[f"{prefix}/info"] = VfsNode("info", "leaf")
+        begin_eid = p.get("begin_eid", 0)
+        end_eid = p.get("end_eid", 0)
+        pass_draw_eids = [
+            str(a.eid)
+            for a in flat
+            if begin_eid <= a.eid <= end_eid and bool(a.flags & (_DRAWCALL | _DISPATCH))
+        ]
+        tree.static[f"{prefix}/draws"] = VfsNode("draws", "dir", list(pass_draw_eids))
+        for deid in pass_draw_eids:
+            tree.static[f"{prefix}/draws/{deid}"] = VfsNode(deid, "alias")
+        tree.static[f"{prefix}/attachments"] = VfsNode("attachments", "dir")
+
+    # /resources
+    tree.static["/resources"] = VfsNode("resources", "dir", list(resource_ids))
+    for rid in resource_ids:
+        tree.static[f"/resources/{rid}"] = VfsNode(rid, "dir", ["info", "usage"])
+        tree.static[f"/resources/{rid}/info"] = VfsNode("info", "leaf")
+        tree.static[f"/resources/{rid}/usage"] = VfsNode("usage", "leaf")
+
+    _textures = textures or []
+    _buffers = buffers or []
+
+    # /textures
+    tex_ids = [str(int(getattr(t, "resourceId", 0))) for t in _textures]
+    tree.static["/textures"] = VfsNode("textures", "dir", list(tex_ids))
+    for t in _textures:
+        rid = str(int(getattr(t, "resourceId", 0)))
+        prefix = f"/textures/{rid}"
+        tex_children = ["info", "image.png", "mips", "data"]
+        tree.static[prefix] = VfsNode(rid, "dir", list(tex_children))
+        tree.static[f"{prefix}/info"] = VfsNode("info", "leaf")
+        tree.static[f"{prefix}/image.png"] = VfsNode("image.png", "leaf_bin")
+        tree.static[f"{prefix}/data"] = VfsNode("data", "leaf_bin")
+        mip_count = getattr(t, "mips", 1)
+        mip_children = [f"{i}.png" for i in range(mip_count)]
+        tree.static[f"{prefix}/mips"] = VfsNode("mips", "dir", list(mip_children))
+        for i in range(mip_count):
+            tree.static[f"{prefix}/mips/{i}.png"] = VfsNode(f"{i}.png", "leaf_bin")
+
+    # /buffers
+    buf_ids = [str(int(getattr(b, "resourceId", 0))) for b in _buffers]
+    tree.static["/buffers"] = VfsNode("buffers", "dir", list(buf_ids))
+    for b in _buffers:
+        rid = str(int(getattr(b, "resourceId", 0)))
+        prefix = f"/buffers/{rid}"
+        buf_children = ["info", "data"]
+        tree.static[prefix] = VfsNode(rid, "dir", list(buf_children))
+        tree.static[f"{prefix}/info"] = VfsNode("info", "leaf")
+        tree.static[f"{prefix}/data"] = VfsNode("data", "leaf_bin")
+
+    # Remaining placeholder dirs
+    tree.static["/shaders"] = VfsNode("shaders", "dir")
+
+    # /counters
+    tree.static["/counters"] = VfsNode("counters", "dir", ["list"])
+    tree.static["/counters/list"] = VfsNode("list", "leaf")
+
+    # /current alias
+    tree.static["/current"] = VfsNode("current", "alias")
+
+    return tree
+
+
+def populate_draw_subtree(
+    tree: VfsTree,
+    eid: int,
+    pipe_state: Any,
+) -> dict[str, list[str]]:
+    """Discover active shader stages and populate draw subtree nodes.
+
+    Args:
+        tree: The VFS tree to update.
+        eid: Draw event ID.
+        pipe_state: Pipeline state object with GetShader().
+
+    Returns:
+        Mapping of path -> child names for the populated subtree.
+    """
+    cached = tree.get_draw_subtree(eid)
+    if cached is not None:
+        return cached
+
+    stages: list[str] = []
+    for stage_name, stage_idx in STAGE_MAP.items():
+        if int(pipe_state.GetShader(stage_idx)) != 0:
+            stages.append(stage_name)
+
+    prefix = f"/draws/{eid}"
+    subtree: dict[str, list[str]] = {}
+
+    # Update shader node children
+    tree.static[f"{prefix}/shader"].children = list(stages)
+    subtree[f"{prefix}/shader"] = list(stages)
+
+    for stage in stages:
+        stage_path = f"{prefix}/shader/{stage}"
+        tree.static[stage_path] = VfsNode(stage, "dir", list(_SHADER_STAGE_CHILDREN))
+        subtree[stage_path] = list(_SHADER_STAGE_CHILDREN)
+
+        for child in _SHADER_STAGE_CHILDREN:
+            child_path = f"{stage_path}/{child}"
+            tree.static[child_path] = VfsNode(child, "leaf")
+
+    # Populate targets subtree
+    targets_path = f"{prefix}/targets"
+    target_children: list[str] = []
+    for i, t in enumerate(pipe_state.GetOutputTargets()):
+        if int(t.resource) != 0:
+            name = f"color{i}.png"
+            target_children.append(name)
+            tree.static[f"{targets_path}/{name}"] = VfsNode(name, "leaf_bin")
+
+    depth = pipe_state.GetDepthTarget()
+    if int(depth.resource) != 0:
+        target_children.append("depth.png")
+        tree.static[f"{targets_path}/depth.png"] = VfsNode("depth.png", "leaf_bin")
+
+    tree.static[targets_path].children = list(target_children)
+    subtree[targets_path] = list(target_children)
+
+    # Populate bindings/ subtree
+    binding_sets: dict[int, set[int]] = {}
+    for stage_name in stages:
+        stage_idx = STAGE_MAP[stage_name]
+        refl = pipe_state.GetShaderReflection(stage_idx)
+        if refl is None:
+            continue
+        for r in getattr(refl, "readOnlyResources", []):
+            s = getattr(r, "fixedBindSetOrSpace", 0)
+            b = getattr(r, "fixedBindNumber", 0)
+            binding_sets.setdefault(s, set()).add(b)
+        for r in getattr(refl, "readWriteResources", []):
+            s = getattr(r, "fixedBindSetOrSpace", 0)
+            b = getattr(r, "fixedBindNumber", 0)
+            binding_sets.setdefault(s, set()).add(b)
+
+    bindings_path = f"{prefix}/bindings"
+    binding_set_names = [str(s) for s in sorted(binding_sets)]
+    tree.static[bindings_path].children = list(binding_set_names)
+    subtree[bindings_path] = list(binding_set_names)
+    for s in sorted(binding_sets):
+        bindings = binding_sets[s]
+        set_path = f"{bindings_path}/{s}"
+        binding_names = [str(b) for b in sorted(bindings)]
+        tree.static[set_path] = VfsNode(str(s), "dir", list(binding_names))
+        subtree[set_path] = list(binding_names)
+        for b in bindings:
+            leaf_path = f"{set_path}/{b}"
+            tree.static[leaf_path] = VfsNode(str(b), "leaf")
+
+    # Populate cbuffer/ subtree
+    cbuffer_sets: dict[int, set[int]] = {}
+    for stage_name in stages:
+        stage_idx = STAGE_MAP[stage_name]
+        refl = pipe_state.GetShaderReflection(stage_idx)
+        if refl is None:
+            continue
+        for cb in getattr(refl, "constantBlocks", []):
+            s = getattr(cb, "fixedBindSetOrSpace", 0)
+            b = getattr(cb, "fixedBindNumber", 0)
+            cbuffer_sets.setdefault(s, set()).add(b)
+
+    cbuffer_path = f"{prefix}/cbuffer"
+    cbuffer_set_names = sorted(str(s) for s in cbuffer_sets)
+    tree.static[cbuffer_path].children = list(cbuffer_set_names)
+    subtree[cbuffer_path] = list(cbuffer_set_names)
+    for s, bindings in cbuffer_sets.items():
+        set_path = f"{cbuffer_path}/{s}"
+        binding_names = sorted(str(b) for b in bindings)
+        tree.static[set_path] = VfsNode(str(s), "dir", list(binding_names))
+        subtree[set_path] = list(binding_names)
+        for b in bindings:
+            leaf_path = f"{set_path}/{b}"
+            tree.static[leaf_path] = VfsNode(str(b), "leaf")
+
+    tree.set_draw_subtree(eid, subtree)
+    return subtree
+
+
+def populate_pass_attachments(
+    tree: VfsTree,
+    pass_name: str,
+    pipe_state: Any,
+) -> None:
+    """Populate /passes/<name>/attachments/ with color and depth leaves."""
+    prefix = f"/passes/{pass_name}/attachments"
+    node = tree.static.get(prefix)
+    if node is None or node.children:
+        return
+
+    children: list[str] = []
+    for i, t in enumerate(pipe_state.GetOutputTargets()):
+        if int(t.resource) != 0:
+            name = f"color{i}"
+            children.append(name)
+            tree.static[f"{prefix}/{name}"] = VfsNode(name, "leaf")
+
+    depth = pipe_state.GetDepthTarget()
+    if int(depth.resource) != 0:
+        children.append("depth")
+        tree.static[f"{prefix}/depth"] = VfsNode("depth", "leaf")
+
+    node.children = list(children)
+
+
+def populate_shaders_subtree(tree: VfsTree, shader_meta: dict[int, dict[str, Any]]) -> None:
+    """Populate /shaders/<id>/ dir nodes from shader metadata.
+
+    Args:
+        tree: The VFS tree to update.
+        shader_meta: Mapping of shader_id -> metadata dict (from DaemonState).
+    """
+    shader_ids = [str(sid) for sid in shader_meta]
+    tree.static["/shaders"] = VfsNode("shaders", "dir", shader_ids)
+    for sid in shader_meta:
+        prefix = f"/shaders/{sid}"
+        tree.static[prefix] = VfsNode(str(sid), "dir", list(_SHADER_CHILDREN))
+        tree.static[f"{prefix}/info"] = VfsNode("info", "leaf")
+        tree.static[f"{prefix}/disasm"] = VfsNode("disasm", "leaf")
+        tree.static[f"{prefix}/used-by"] = VfsNode("used-by", "leaf")
