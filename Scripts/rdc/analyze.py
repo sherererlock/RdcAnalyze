@@ -23,7 +23,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from shared import guess_bpp, unwrap, fmt_number, fmt_mb, rt_bytes
+from shared import (
+    guess_bpp, unwrap, fmt_number, fmt_mb, rt_bytes,
+    classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad,
+    STAGE_COLORS,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -412,6 +416,148 @@ def analyze_memory(data: dict) -> dict:
     }
 
 
+def analyze_pipeline_stages(data: dict) -> dict:
+    """Classify each pass into a pipeline stage using metadata heuristics."""
+    summary = data.get("summary") or {}
+    pass_details = data.get("pass_details") or []
+    draws_list = _unwrap(summary.get("draws"), "draws") or []
+
+    counters_raw = summary.get("counters") or {}
+    counter_rows = counters_raw.get("rows") or (
+        counters_raw if isinstance(counters_raw, list) else []
+    )
+    counters_by_eid: dict[int, dict] = {}
+    for r in counter_rows:
+        if not isinstance(r, dict):
+            continue
+        eid = r.get("eid")
+        if eid is None:
+            continue
+        eid = int(eid)
+        if eid not in counters_by_eid:
+            counters_by_eid[eid] = {}
+        counters_by_eid[eid][r.get("counter", "")] = r.get("value", 0)
+
+    bloom = detect_bloom_chain(pass_details)
+    bloom_names: set[str] = set()
+    if bloom:
+        bloom_names = set(bloom["passes"])
+
+    max_rt_area = 0
+    for p in pass_details:
+        for ct in (p.get("color_targets") or []):
+            area = ct.get("width", 0) * ct.get("height", 0)
+            if area > max_rt_area:
+                max_rt_area = area
+
+    pass_deps = summary.get("pass_deps") or {}
+    per_pass_rw = pass_deps.get("per_pass") or []
+    rw_by_name: dict[str, dict] = {}
+    for pp in per_pass_rw:
+        if isinstance(pp, dict):
+            rw_by_name[pp.get("name", "")] = pp
+
+    stages = []
+    stage_times: dict[str, float] = {}
+    stage_counts: dict[str, int] = {}
+
+    for p in pass_details:
+        name = p.get("name", "")
+        begin_eid = p.get("begin_eid", 0)
+        end_eid = p.get("end_eid", 0)
+
+        is_auto_name = bool(re.match(
+            r"^(Colour|Depth-only|Compute|Copy/Clear) Pass #\d+", name
+        ))
+        if is_auto_name:
+            stage, reason = classify_pass_stage(
+                p,
+                all_passes=pass_details,
+                bloom_pass_names=bloom_names,
+                max_rt_area=max_rt_area,
+            )
+        else:
+            cat = _classify_pass(name, draws=p.get("draws", 0), dispatches=p.get("dispatches", 0))
+            if cat == "Other":
+                stage, reason = classify_pass_stage(
+                    p,
+                    all_passes=pass_details,
+                    bloom_pass_names=bloom_names,
+                    max_rt_area=max_rt_area,
+                )
+            else:
+                stage = cat
+                reason = f"name keyword: '{name}'"
+
+        gpu_time_us = 0.0
+        ps_inv = 0
+        for eid_key, cdata in counters_by_eid.items():
+            if begin_eid <= eid_key <= end_eid:
+                gpu_time_us += cdata.get("GPU Duration", 0.0) * 1e6
+                ps_inv += int(cdata.get("PS Invocations", 0))
+
+        cts = p.get("color_targets") or []
+        rt_w = cts[0].get("width", 0) if cts else 0
+        rt_h = cts[0].get("height", 0) if cts else 0
+        rt_fmt = cts[0].get("format", "") if cts else ""
+        if not cts:
+            dt = p.get("depth_target")
+            if isinstance(dt, dict):
+                rt_w = dt.get("width", 0)
+                rt_h = dt.get("height", 0)
+                rt_fmt = dt.get("format", "")
+
+        draws_in_pass = [
+            d for d in draws_list
+            if isinstance(d, dict) and begin_eid <= d.get("eid", 0) <= end_eid
+        ]
+        is_fs = detect_fullscreen_quad(draws_in_pass, rt_w, rt_h, counters_by_eid)
+
+        rw = rw_by_name.get(name, {})
+
+        stages.append({
+            "pass_name": name,
+            "stage": stage,
+            "reason": reason,
+            "color": STAGE_COLORS.get(stage, "#555f78"),
+            "begin_eid": begin_eid,
+            "end_eid": end_eid,
+            "draws": p.get("draws", 0),
+            "dispatches": p.get("dispatches", 0),
+            "triangles": p.get("triangles", 0),
+            "gpu_time_us": round(gpu_time_us, 1),
+            "ps_invocations": ps_inv,
+            "is_fullscreen": is_fs,
+            "rt_width": rt_w,
+            "rt_height": rt_h,
+            "rt_format": rt_fmt,
+            "writes_to": rw.get("writes") or [],
+            "reads_from": rw.get("reads") or [],
+        })
+
+        stage_times[stage] = stage_times.get(stage, 0.0) + gpu_time_us
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+
+    total_time = sum(stage_times.values())
+    stage_groups = []
+    for stg in sorted(stage_times, key=lambda s: -stage_times[s]):
+        pct = (stage_times[stg] / total_time * 100) if total_time > 0 else 0
+        stage_groups.append({
+            "stage": stg,
+            "passes": stage_counts[stg],
+            "gpu_time_us": round(stage_times[stg], 1),
+            "pct": round(pct, 1),
+            "color": STAGE_COLORS.get(stg, "#555f78"),
+        })
+
+    return {
+        "stages": stages,
+        "stage_groups": stage_groups,
+        "bloom_chain": bloom,
+        "total_gpu_time_us": round(total_time, 1),
+    }
+
+
 def generate_suggestions(analysis: dict, data: dict) -> list[dict]:
     suggestions = []
 
@@ -671,6 +817,101 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
         <th>Draws</th><th>Dispatches</th><th>Triangles</th><th>EID Range</th><th>Render Targets</th>
       </tr></thead>
       <tbody>{"".join(pass_table_rows)}</tbody>
+    </table>
+    </div>
+    """
+
+    # Section 2b: Pipeline Stage Analysis
+    pstages = analysis.get("pipeline_stages") or {}
+    stage_groups = pstages.get("stage_groups") or []
+    stage_list = pstages.get("stages") or []
+    bloom_chain = pstages.get("bloom_chain")
+    total_gpu_us = pstages.get("total_gpu_time_us", 0)
+
+    # Stage distribution bars
+    stage_dist_bars = []
+    max_stage_time = max((g["gpu_time_us"] for g in stage_groups), default=1)
+    for g in stage_groups:
+        pct = g["gpu_time_us"] / max(max_stage_time, 1) * 100
+        stage_dist_bars.append(
+            f'<div class="bar-row">'
+            f'<div class="bar-label"><span class="cat-dot" style="background:{g["color"]}"></span>'
+            f'{_esc(g["stage"])}'
+            f'<span class="bar-sub">{g["passes"]} pass{"es" if g["passes"] != 1 else ""}</span></div>'
+            f'<div class="bar-track">'
+            f'<div class="bar-fill" style="width:{pct:.1f}%;background:{g["color"]}">'
+            f'</div></div>'
+            f'<div class="bar-value">{g["gpu_time_us"]:.0f} us ({g["pct"]:.0f}%)</div>'
+            f'</div>'
+        )
+
+    # Stage-annotated pass table
+    stage_table_rows = []
+    for i, s in enumerate(stage_list):
+        fs_tag = '<span class="tag tag-fs">FS</span>' if s.get("is_fullscreen") else ""
+        stage_table_rows.append(
+            f'<tr>'
+            f'<td>{i}</td>'
+            f'<td><span class="cat-dot" style="background:{s["color"]}"></span>{_esc(s["pass_name"])}</td>'
+            f'<td><span class="stage-tag" style="background:{s["color"]}20;color:{s["color"]};'
+            f'border:1px solid {s["color"]}40">{_esc(s["stage"])}</span></td>'
+            f'<td>{_esc(s["reason"])}</td>'
+            f'<td class="num">{s["gpu_time_us"]:.0f}</td>'
+            f'<td class="num">{_fmt_number(s["ps_invocations"])}</td>'
+            f'<td class="num">{s["rt_width"]}x{s["rt_height"]}</td>'
+            f'<td>{_esc(s["rt_format"])}{fs_tag}</td>'
+            f'</tr>'
+        )
+
+    # Bloom chain visualization
+    bloom_html = ""
+    if bloom_chain and bloom_chain.get("detected"):
+        bloom_steps = []
+        for k, (res, direction) in enumerate(zip(
+            bloom_chain.get("resolutions", []),
+            bloom_chain.get("directions", []),
+        )):
+            arrow = ""
+            if direction == "down":
+                arrow = '<span class="bloom-arrow">&#8595;</span>'
+            elif direction == "up":
+                arrow = '<span class="bloom-arrow" style="color:#22b07a">&#8593;</span>'
+            elif direction == "threshold":
+                arrow = '<span class="bloom-arrow" style="color:#d4a017">&#9670;</span>'
+            elif direction == "same":
+                arrow = '<span class="bloom-arrow">&#8594;</span>'
+            bloom_steps.append(
+                f'<div class="bloom-step">'
+                f'{arrow}<div class="bloom-res">{_esc(res)}</div>'
+                f'<div class="bloom-label">{_esc(direction)}</div></div>'
+            )
+        bloom_html = f"""
+        <h4>Bloom Chain ({bloom_chain.get("levels", 0)} levels)</h4>
+        <div class="bloom-chain">{"".join(bloom_steps)}</div>
+        """
+
+    pipeline_stages_html = f"""
+    <div class="mini-cards">
+      <div class="mini-card">
+        <div class="mini-label">Total GPU Time</div>
+        <div class="mini-value">{total_gpu_us:.0f} us</div>
+      </div>
+      <div class="mini-card">
+        <div class="mini-label">Stage Types</div>
+        <div class="mini-value">{len(stage_groups)}</div>
+      </div>
+    </div>
+    <h4>GPU Time by Stage</h4>
+    <div class="chart-area">{"".join(stage_dist_bars)}</div>
+    {bloom_html}
+    <h4>Pass Classification</h4>
+    <div class="table-wrap">
+    <table class="data-table sortable">
+      <thead><tr>
+        <th>#</th><th>Pass Name</th><th>Stage</th><th>Reason</th>
+        <th>GPU (us)</th><th>PS Invocations</th><th>RT Size</th><th>Format</th>
+      </tr></thead>
+      <tbody>{"".join(stage_table_rows)}</tbody>
     </table>
     </div>
     """
@@ -1152,6 +1393,60 @@ body::before {{
   margin-top: 3px;
 }}
 
+/* ── Stage tags ── */
+.stage-tag {{
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+}}
+.tag-fs {{
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--accent-cyan);
+  color: var(--bg-base);
+  margin-left: 6px;
+}}
+
+/* ── Bloom chain ── */
+.bloom-chain {{
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 16px;
+  overflow-x: auto;
+  background: var(--bg-card);
+  border-radius: 8px;
+  margin-bottom: 20px;
+}}
+.bloom-step {{
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 80px;
+}}
+.bloom-arrow {{
+  font-size: 20px;
+  color: var(--heat-warm);
+  margin-bottom: 4px;
+}}
+.bloom-res {{
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  font-weight: 600;
+}}
+.bloom-label {{
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}}
+
 /* ── Bar charts ── */
 .bar-chart {{
   display: flex;
@@ -1392,9 +1687,18 @@ h4 {{
     <div class="section-body">{pipeline_html}</div>
   </div>
 
+  <div class="section" id="sec-stages">
+    <div class="section-header" onclick="toggleSection('sec-stages')">
+      <span class="section-num">03</span>
+      <h2>Pipeline Stage Analysis</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="section-body">{pipeline_stages_html}</div>
+  </div>
+
   <div class="section" id="sec-hotspots">
     <div class="section-header" onclick="toggleSection('sec-hotspots')">
-      <span class="section-num">03</span>
+      <span class="section-num">04</span>
       <h2>Triangle &amp; Draw Call Hotspots</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -1403,7 +1707,7 @@ h4 {{
 
   <div class="section" id="sec-bandwidth">
     <div class="section-header" onclick="toggleSection('sec-bandwidth')">
-      <span class="section-num">04</span>
+      <span class="section-num">05</span>
       <h2>Bandwidth Estimation</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -1412,7 +1716,7 @@ h4 {{
 
   <div class="section" id="sec-shaders">
     <div class="section-header" onclick="toggleSection('sec-shaders')">
-      <span class="section-num">05</span>
+      <span class="section-num">06</span>
       <h2>Shader Complexity</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -1421,7 +1725,7 @@ h4 {{
 
   <div class="section" id="sec-memory">
     <div class="section-header" onclick="toggleSection('sec-memory')">
-      <span class="section-num">06</span>
+      <span class="section-num">07</span>
       <h2>Texture &amp; Memory</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -1430,7 +1734,7 @@ h4 {{
 
   <div class="section" id="sec-suggestions">
     <div class="section-header" onclick="toggleSection('sec-suggestions')">
-      <span class="section-num">07</span>
+      <span class="section-num">08</span>
       <h2>Optimization Suggestions</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -1506,6 +1810,7 @@ def main():
     analysis = {
         "overview": analyze_frame_overview(data),
         "pipeline": analyze_pipeline(data),
+        "pipeline_stages": analyze_pipeline_stages(data),
         "hotspots": analyze_hotspots(data),
         "bandwidth": analyze_bandwidth(data),
         "shaders": analyze_shaders(data),

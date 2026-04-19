@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from rpc import _unwrap
+from shared import classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad
 
 
 def write_tsv(path: Path, headers: list[str], rows: list[list]) -> None:
@@ -246,6 +247,126 @@ def _build_shaders(shader_disasm: dict) -> tuple[list[str], list[list]]:
     return headers, rows
 
 
+def _build_pipeline_stages(
+    summary: dict,
+    pass_details: list[dict],
+    counters_by_eid: dict[int, dict] | None = None,
+) -> tuple[list[str], list[list], list[str], list[list]]:
+    """Build pipeline_stages.tsv and stage_summary.tsv data."""
+    bloom = detect_bloom_chain(pass_details)
+    bloom_names: set[str] = set()
+    if bloom:
+        bloom_names = set(bloom["passes"])
+
+    max_rt_area = 0
+    for p in pass_details:
+        for ct in (p.get("color_targets") or []):
+            area = ct.get("width", 0) * ct.get("height", 0)
+            if area > max_rt_area:
+                max_rt_area = area
+
+    draws_list = _unwrap(summary.get("draws"), "draws") or []
+    pass_deps = summary.get("pass_deps") or {}
+    per_pass_rw = pass_deps.get("per_pass") or []
+    rw_by_name: dict[str, dict] = {}
+    for pp in per_pass_rw:
+        if isinstance(pp, dict):
+            rw_by_name[pp.get("name", "")] = pp
+
+    stage_headers = [
+        "pass_name", "stage", "reason", "begin_eid", "end_eid",
+        "draws", "dispatches", "triangles",
+        "gpu_time_us", "ps_invocations", "is_fullscreen",
+        "rt_width", "rt_height", "rt_format",
+        "writes_to", "reads_from",
+    ]
+    stage_rows = []
+    stage_times: dict[str, float] = {}
+    stage_counts: dict[str, int] = {}
+
+    for p in pass_details:
+        name = p.get("name", "")
+        begin_eid = p.get("begin_eid", 0)
+        end_eid = p.get("end_eid", 0)
+
+        stage, reason = classify_pass_stage(
+            p,
+            all_passes=pass_details,
+            bloom_pass_names=bloom_names,
+            max_rt_area=max_rt_area,
+        )
+
+        gpu_time_us = 0.0
+        ps_inv = 0
+        if counters_by_eid:
+            for eid_key, cdata in counters_by_eid.items():
+                if begin_eid <= eid_key <= end_eid:
+                    gpu_time_us += cdata.get("GPU Duration", 0.0) * 1e6
+                    ps_inv += int(cdata.get("PS Invocations", 0))
+
+        cts = p.get("color_targets") or []
+        rt_w = cts[0].get("width", 0) if cts else 0
+        rt_h = cts[0].get("height", 0) if cts else 0
+        rt_fmt = cts[0].get("format", "") if cts else ""
+        if not cts:
+            dt = p.get("depth_target")
+            if isinstance(dt, dict):
+                rt_w = dt.get("width", 0)
+                rt_h = dt.get("height", 0)
+                rt_fmt = dt.get("format", "")
+
+        draws_in_pass = [
+            d for d in draws_list
+            if isinstance(d, dict) and begin_eid <= d.get("eid", 0) <= end_eid
+        ]
+        is_fs = detect_fullscreen_quad(draws_in_pass, rt_w, rt_h, counters_by_eid)
+
+        rw = rw_by_name.get(name, {})
+        writes = rw.get("writes") or []
+        reads = rw.get("reads") or []
+
+        stage_rows.append([
+            name, stage, reason, begin_eid, end_eid,
+            p.get("draws", 0), p.get("dispatches", 0), p.get("triangles", 0),
+            round(gpu_time_us, 1), ps_inv, is_fs,
+            rt_w, rt_h, rt_fmt,
+            ",".join(str(r) for r in writes),
+            ",".join(str(r) for r in reads),
+        ])
+
+        stage_times[stage] = stage_times.get(stage, 0.0) + gpu_time_us
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+
+    total_time = sum(stage_times.values())
+    summary_headers = ["stage", "passes", "gpu_time_us", "pct"]
+    summary_rows = []
+    for stage in sorted(stage_times, key=lambda s: -stage_times[s]):
+        pct = (stage_times[stage] / total_time * 100) if total_time > 0 else 0
+        summary_rows.append([
+            stage, stage_counts[stage], round(stage_times[stage], 1), round(pct, 1),
+        ])
+
+    return stage_headers, stage_rows, summary_headers, summary_rows
+
+
+def _build_counters_by_eid(summary: dict) -> dict[int, dict]:
+    """Build a dict mapping eid -> {counter_name: value} from counters data."""
+    counters = summary.get("counters") or {}
+    raw = counters.get("rows") or (counters if isinstance(counters, list) else [])
+    result: dict[int, dict] = {}
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        eid = r.get("eid")
+        if eid is None:
+            continue
+        eid = int(eid)
+        if eid not in result:
+            result[eid] = {}
+        result[eid][r.get("counter", "")] = r.get("value", 0)
+    return result
+
+
 def export_tsv(
     tsv_dir: Path,
     summary: dict,
@@ -270,6 +391,14 @@ def export_tsv(
         "pass_rw": _build_pass_rw(summary),
         "alerts": _build_alerts(computed or {}),
     }
+
+    counters_by_eid = _build_counters_by_eid(summary)
+    sh, sr, sumh, sumr = _build_pipeline_stages(summary, pass_details, counters_by_eid)
+    if sh:
+        tables["pipeline_stages"] = (sh, sr)
+    if sumh:
+        tables["stage_summary"] = (sumh, sumr)
+
     written = 0
     for name, (headers, rows) in tables.items():
         if headers:

@@ -378,6 +378,214 @@ def dedup_frames(summary: dict, pass_details: list) -> tuple[dict, list]:
     return new_summary, kept_pd
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Pipeline stage classification (metadata-driven heuristics)
+# ─────────────────────────────────────────────────────────────────────
+
+STAGE_COLORS: dict[str, str] = {
+    "Compute": "#6366f1",
+    "ShadowMap": "#8b5cf6",
+    "DepthPrepass": "#a78bfa",
+    "GBuffer": "#3b82f6",
+    "MainColor": "#22b07a",
+    "Geometry": "#22b07a",
+    "Transparent": "#06b6d4",
+    "PostProcess": "#d4a017",
+    "Bloom": "#f59e0b",
+    "UI": "#ec4899",
+    "Compositing": "#64748b",
+    "Present": "#475569",
+    "Hair": "#f59e0b",
+    "Other": "#555f78",
+}
+
+
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _has_depth_format(fmt: str) -> bool:
+    return any(k in fmt.upper() for k in ("D16", "D24", "D32"))
+
+
+def _has_srgb_format(fmt: str) -> bool:
+    return "SRGB" in fmt.upper()
+
+
+def _get_pass_rt_info(p: dict) -> dict:
+    cts = p.get("color_targets") or []
+    dt = p.get("depth_target")
+    color_fmt = cts[0].get("format", "") if cts else ""
+    color_w = cts[0].get("width", 0) if cts else 0
+    color_h = cts[0].get("height", 0) if cts else 0
+    depth_fmt = dt.get("format", "") if isinstance(dt, dict) else ""
+    depth_w = dt.get("width", 0) if isinstance(dt, dict) else 0
+    depth_h = dt.get("height", 0) if isinstance(dt, dict) else 0
+    return {
+        "n_color": len(cts), "color_fmt": color_fmt,
+        "color_w": color_w, "color_h": color_h,
+        "has_depth": bool(dt), "depth_fmt": depth_fmt,
+        "depth_w": depth_w, "depth_h": depth_h,
+    }
+
+
+def _load_ops_set(p: dict) -> set[str]:
+    ops = p.get("load_ops") or []
+    return {op[1] for op in ops if len(op) >= 2}
+
+
+def classify_pass_stage(
+    p: dict,
+    *,
+    all_passes: list[dict] | None = None,
+    bloom_pass_names: set[str] | None = None,
+    max_rt_area: int = 0,
+    max_rt_resource_id: int | None = None,
+) -> tuple[str, str]:
+    """Classify a render pass into a pipeline stage using metadata heuristics.
+
+    Returns (stage_name, reason).
+    """
+    name = p.get("name", "")
+    draws = p.get("draws", 0)
+    dispatches = p.get("dispatches", 0)
+    triangles = p.get("triangles", 0)
+    rt = _get_pass_rt_info(p)
+    load_ops = _load_ops_set(p)
+
+    if bloom_pass_names and name in bloom_pass_names:
+        return "Bloom", "bloom chain member"
+
+    if dispatches > 0 and draws == 0:
+        return "Compute", "dispatches only"
+
+    if rt["n_color"] == 0 and rt["has_depth"]:
+        dw, dh = rt["depth_w"], rt["depth_h"]
+        if _has_depth_format(rt["depth_fmt"]) and _is_power_of_two(dw) and _is_power_of_two(dh):
+            return "ShadowMap", f"depth-only {rt['depth_fmt']} {dw}x{dh} (power-of-2)"
+        return "DepthPrepass", f"depth-only {rt['depth_fmt']} {dw}x{dh}"
+
+    if draws > 0 and rt["n_color"] > 0:
+        avg_tri = triangles / max(draws, 1)
+        if _has_srgb_format(rt["color_fmt"]) and "Clear" in load_ops and draws >= 3 and avg_tri < 500:
+            return "UI", f"SRGB+Clear, {draws} draws, avg {avg_tri:.0f} tri"
+
+        cw, ch = rt["color_w"], rt["color_h"]
+        rt_area = cw * ch
+        if max_rt_area > 0 and rt_area >= max_rt_area * 0.9:
+            if draws <= 2 and triangles <= 4 and not rt["has_depth"]:
+                if not _has_srgb_format(rt["color_fmt"]) and "UNORM" in rt["color_fmt"].upper():
+                    return "Compositing", f"blit to large UNORM RT {cw}x{ch}"
+
+        if rt["has_depth"] and "Clear" in load_ops and draws >= 5:
+            return "MainColor", f"color+depth, Clear, {draws} draws"
+
+        if draws == 1 and triangles <= 2:
+            return "PostProcess", f"fullscreen quad to {rt['color_fmt']}"
+
+    return "Other", "no heuristic matched"
+
+
+def detect_bloom_chain(pass_details: list[dict]) -> dict | None:
+    """Detect a bloom downsample-upsample pyramid in a sequence of passes.
+
+    Returns bloom info dict or None.
+    """
+    if len(pass_details) < 3:
+        return None
+
+    for start in range(len(pass_details)):
+        p0 = pass_details[start]
+        cts0 = p0.get("color_targets") or []
+        if not cts0 or p0.get("draws", 0) != 1:
+            continue
+        base_fmt = cts0[0].get("format", "")
+        if not base_fmt:
+            continue
+
+        chain = [start]
+        base_w = cts0[0].get("width", 0)
+        base_h = cts0[0].get("height", 0)
+        prev_w, prev_h = base_w, base_h
+        directions = ["threshold"]
+        downs = 0
+        ups = 0
+
+        for j in range(start + 1, len(pass_details)):
+            pj = pass_details[j]
+            ctsj = pj.get("color_targets") or []
+            if not ctsj or pj.get("draws", 0) != 1:
+                break
+            fmt_j = ctsj[0].get("format", "")
+            if fmt_j != base_fmt:
+                break
+            wj = ctsj[0].get("width", 0)
+            hj = ctsj[0].get("height", 0)
+
+            ratio_w = prev_w / max(wj, 1)
+            ratio_h = prev_h / max(hj, 1)
+
+            if 1.8 <= ratio_w <= 2.2 and 1.8 <= ratio_h <= 2.2:
+                directions.append("down")
+                downs += 1
+            elif 0.45 <= ratio_w <= 0.55 and 0.45 <= ratio_h <= 0.55:
+                directions.append("up")
+                ups += 1
+            elif 0.9 <= ratio_w <= 1.1 and 0.9 <= ratio_h <= 1.1:
+                directions.append("same")
+            elif (ups > 0 and
+                  0.9 <= wj / max(base_w, 1) <= 1.1 and
+                  0.9 <= hj / max(base_h, 1) <= 1.1):
+                directions.append("composite")
+                ups += 1
+            else:
+                break
+
+            chain.append(j)
+            prev_w, prev_h = wj, hj
+
+        if downs >= 2 and ups >= 1 and len(chain) >= 4:
+            resolutions = []
+            pass_names = []
+            for idx in chain:
+                pc = pass_details[idx]
+                ct = (pc.get("color_targets") or [{}])[0]
+                resolutions.append(f"{ct.get('width', 0)}x{ct.get('height', 0)}")
+                pass_names.append(pc.get("name", ""))
+            return {
+                "detected": True,
+                "levels": downs,
+                "passes": pass_names,
+                "pass_indices": chain,
+                "resolutions": resolutions,
+                "directions": directions,
+            }
+
+    return None
+
+
+def detect_fullscreen_quad(
+    draws_in_pass: list[dict],
+    rt_width: int,
+    rt_height: int,
+    counters_by_eid: dict[int, dict] | None = None,
+) -> bool:
+    """Check if all draws in a pass are fullscreen quads."""
+    if not draws_in_pass:
+        return False
+    if any(d.get("triangles", 0) > 2 for d in draws_in_pass):
+        return False
+    if counters_by_eid:
+        total_ps = sum(
+            counters_by_eid.get(d.get("eid", 0), {}).get("PS Invocations", 0)
+            for d in draws_in_pass
+        )
+        rt_pixels = rt_width * rt_height
+        if rt_pixels > 0 and total_ps > 0:
+            return total_ps >= rt_pixels * 0.8
+    return len(draws_in_pass) <= 2
+
+
 def _renumber_deduped(passes: list[dict]) -> None:
     """Renumber passes per-type after dedup removed old-frame passes."""
     counters: dict[str, int] = {}
