@@ -141,7 +141,11 @@ def main() -> None:
         write_json(out_dir / "pass_details.json", pass_details)
         timings["pass_details"] = time.time() - t0
 
-        # ── Step 3.1: Frame dedup ──
+        # ── Step 3.1: Sync pass names + dedup ──
+        coarse = _unwrap(summary.get("passes"), "passes") or []
+        for sp, pd in zip(coarse, pass_details):
+            if isinstance(sp, dict) and isinstance(pd, dict):
+                sp["name"] = pd["name"]
         summary, pass_details = dedup_frames(summary, pass_details)
         write_json(out_dir / "summary.json", summary)
         write_json(out_dir / "pass_details.json", pass_details)

@@ -369,4 +369,24 @@ def dedup_frames(summary: dict, pass_details: list) -> tuple[dict, list]:
           f"(cut EID <= {cut_eid}, "
           f"kept {len(kept_pd)} passes, {len(new_draws)} draws, {len(new_events)} events)")
 
+    _renumber_deduped(kept_pd)
+    coarse = unwrap(new_summary.get("passes"), "passes") or []
+    for sp, pd in zip(coarse, kept_pd):
+        if isinstance(sp, dict) and isinstance(pd, dict):
+            sp["name"] = pd["name"]
+
     return new_summary, kept_pd
+
+
+def _renumber_deduped(passes: list[dict]) -> None:
+    """Renumber passes per-type after dedup removed old-frame passes."""
+    counters: dict[str, int] = {}
+    _PREFIX_RE = re.compile(r"^(Compute Pass|Depth-only Pass|Copy/Clear Pass|Colour Pass) #\d+(.*)")
+    for p in passes:
+        name = p.get("name", "")
+        m = _PREFIX_RE.match(name)
+        if not m:
+            continue
+        prefix, suffix = m.group(1), m.group(2)
+        counters[prefix] = counters.get(prefix, 0) + 1
+        p["name"] = f"{prefix} #{counters[prefix]}{suffix}"
