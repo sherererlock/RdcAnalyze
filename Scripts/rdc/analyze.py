@@ -535,7 +535,8 @@ def analyze_pipeline_stages(data: dict) -> dict:
             else:
                 _shader_content_cache[shader_key] = ""
         content = _shader_content_cache[shader_key]
-        patterns = detect_shader_patterns(content) if content else []
+        is_cs = "cs_id" in info
+        patterns = detect_shader_patterns(content, is_compute=is_cs) if content else []
         _shader_patterns_cache[shader_key] = patterns
         return patterns
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────
@@ -590,75 +591,193 @@ def detect_fullscreen_quad(
 # Shader pattern recognition (SPIR-V disassembly heuristics)
 # ─────────────────────────────────────────────────────────────────────
 
-def detect_shader_patterns(shader_content: str) -> list[str]:
-    """Detect common shader algorithm patterns from SPIR-V disassembly.
 
-    Analyzes only the Pixel Shader section. Returns list of detected
-    pattern names (e.g. ["FXAA", "Dithering"]).
-    """
-    # Extract pixel shader section only
-    parts = shader_content.split("Pixel Shader")
-    if len(parts) < 2:
-        return []
-    ps_text = parts[1]
+@dataclass
+class ShaderContext:
+    """Pre-parsed shader signals, computed once per shader."""
+    ps_text: str
+    is_compute: bool
+    spirv_bound: int
+    sample_count: int
+    dref_count: int
+    has_cube_sampler: bool
+    has_log2_exp2: bool
+    dot_count: int
+    has_inversesqrt: bool
+    has_fclamp_01: bool
 
-    # Parse SPIR-V bound
-    bound_match = re.search(r"<id> bound of (\d+)", ps_text)
+
+def _build_shader_context(shader_content: str, is_compute: bool = False) -> ShaderContext | None:
+    if is_compute:
+        text = shader_content
+    else:
+        parts = shader_content.split("Pixel Shader")
+        if len(parts) < 2:
+            return None
+        text = parts[1]
+
+    bound_match = re.search(r"<id> bound of (\d+)", text)
     spirv_bound = int(bound_match.group(1)) if bound_match else 0
 
-    # Count texture sample operations
     sample_count = (
-        ps_text.count("ImageSampleImplicitLod")
-        + ps_text.count("ImageSampleExplicitLod")
-        + ps_text.count("ImageSampleDrefImplicitLod")
+        text.count("ImageSampleImplicitLod")
+        + text.count("ImageSampleExplicitLod")
+        + text.count("ImageSampleDrefImplicitLod")
+        + text.count("ImageSampleDrefExplicitLod")
+    )
+    dref_count = (
+        text.count("ImageSampleDrefImplicitLod")
+        + text.count("ImageSampleDrefExplicitLod")
     )
 
+    return ShaderContext(
+        ps_text=text,
+        is_compute=is_compute,
+        spirv_bound=spirv_bound,
+        sample_count=sample_count,
+        dref_count=dref_count,
+        has_cube_sampler="SampledImage<float, Cube>" in text,
+        has_log2_exp2="Log2" in text and "Exp2" in text,
+        dot_count=text.count("Dot("),
+        has_inversesqrt="InverseSqrt" in text,
+        has_fclamp_01=bool(re.search(r"FClamp\([^,]+,\s*0\.0+,\s*1\.0+\)", text)),
+    )
+
+
+_PATTERN_REGISTRY: list[tuple[str, bool, object]] = []
+
+
+def _register(name: str, *, exclusive: bool = False):
+    def wrapper(fn):
+        _PATTERN_REGISTRY.append((name, exclusive, fn))
+        return fn
+    return wrapper
+
+
+@_register("Fullscreen Blit", exclusive=True)
+def _detect_fullscreen_blit(ctx: ShaderContext) -> str | None:
+    if ctx.sample_count == 1 and ctx.spirv_bound < 50:
+        return "Fullscreen Blit"
+    return None
+
+
+@_register("Dithering")
+def _detect_dithering(ctx: ShaderContext) -> str | None:
+    t = ctx.ps_text
+    if ("SpecId" in t and "FragCoord" in t
+            and re.search(r"& 1\b", t) and re.search(r"<< 1\b", t)
+            and "Round" in t):
+        return "Dithering"
+    return None
+
+
+@_register("FXAA")
+def _detect_fxaa(ctx: ShaderContext) -> str | None:
+    t = ctx.ps_text
+    has_fmax = "FMax" in t
+    has_fmin = "FMin" in t
+    if ctx.sample_count >= 5 and has_fmax and has_fmin and ctx.spirv_bound > 400:
+        return "FXAA"
+    return None
+
+
+@_register("Bloom Threshold")
+def _detect_bloom_threshold(ctx: ShaderContext) -> str | None:
+    t = ctx.ps_text
+    if (ctx.sample_count >= 1
+            and re.search(r"FMax.*\.(xy|yz|xz|xyz)", t)
+            and (re.search(r"\bFSub\b", t) or " - " in t)
+            and (re.search(r"FMax\(.*0\.0", t) or "FClamp" in t)
+            and ("FMul" in t or " * " in t)):
+        return "Bloom Threshold"
+    return None
+
+
+@_register("Gaussian Blur")
+def _detect_gaussian_blur(ctx: ShaderContext) -> str | None:
+    t = ctx.ps_text
+    if ctx.sample_count < 3:
+        return None
+    offset_count = len(re.findall(r"(?:FAdd|FSub).*(?:float2|float)", t[:4000]))
+    mul_count = t.count("FMul") + t.count(" * ")
+    if offset_count >= 2 and mul_count >= 3:
+        explicit = t.count("ImageSampleExplicitLod")
+        implicit = t.count("ImageSampleImplicitLod")
+        if explicit >= 3 or implicit >= 3:
+            return "Gaussian Blur"
+    return None
+
+
+@_register("Tonemapping")
+def _detect_tonemapping(ctx: ShaderContext) -> str | None:
+    t = ctx.ps_text
+    has_pow = "Pow" in t
+    has_matrix = bool(re.search(r"float[34]x[34]|MatrixTimesVector|VectorTimesMatrix", t))
+    if has_pow and (ctx.sample_count >= 2 or has_matrix):
+        return "Tonemapping"
+    return None
+
+
+@_register("Shadow Map")
+def _detect_shadow_map(ctx: ShaderContext) -> str | None:
+    if ctx.dref_count < 1:
+        return None
+    t = ctx.ps_text
+    if "SampledImage<float, 2D>" not in t:
+        return None
+    if ctx.has_fclamp_01 or "FMax" in t or " * " in t:
+        return "Shadow Map"
+    return None
+
+
+@_register("PBR IBL")
+def _detect_pbr_ibl(ctx: ShaderContext) -> str | None:
+    if not ctx.has_cube_sampler:
+        return None
+    t = ctx.ps_text
+    signals = sum([
+        ctx.has_log2_exp2,
+        ctx.has_inversesqrt and ctx.dot_count >= 3,
+        ctx.has_fclamp_01,
+        "ImageSampleExplicitLod" in t,
+    ])
+    if signals >= 2:
+        return "PBR IBL"
+    return None
+
+
+# TODO stubs — no ground truth captures available yet
+
+@_register("SSAO")
+def _detect_ssao(ctx: ShaderContext) -> str | None:
+    # TODO: ≥8 depth samples + noise texture + hemisphere sampling
+    return None
+
+
+@_register("SSR")
+def _detect_ssr(ctx: ShaderContext) -> str | None:
+    # TODO: ray march loop + depth compare + screen-space coords
+    return None
+
+
+@_register("Bilateral Filter")
+def _detect_bilateral(ctx: ShaderContext) -> str | None:
+    # TODO: weighted sampling + depth-based weight falloff
+    return None
+
+
+def detect_shader_patterns(shader_content: str, is_compute: bool = False) -> list[str]:
+    """Detect shader algorithm patterns from RenderDoc SPIR-V disassembly."""
+    ctx = _build_shader_context(shader_content, is_compute)
+    if ctx is None:
+        return []
     detected: list[str] = []
-
-    # ── Fullscreen Blit: single sample + very short shader ──
-    if sample_count == 1 and spirv_bound < 50:
-        detected.append("Fullscreen Blit")
-        return detected  # mutually exclusive with complex patterns
-
-    # ── Dithering: SpecId + FragCoord + bit ops (& 1, << 1) + Round ──
-    has_specid = "SpecId" in ps_text
-    has_fragcoord = "FragCoord" in ps_text
-    has_bit_and1 = bool(re.search(r"& 1\b", ps_text))
-    has_bit_shl1 = bool(re.search(r"<< 1\b", ps_text))
-    has_round = "Round" in ps_text
-    if has_specid and has_fragcoord and has_bit_and1 and has_bit_shl1 and has_round:
-        detected.append("Dithering")
-
-    # ── FXAA: >=5 ImageSample* + FMax + FMin on same channel + large shader ──
-    has_fmax = "FMax" in ps_text or "GLSL.std.450::FMax" in ps_text
-    has_fmin = "FMin" in ps_text or "GLSL.std.450::FMin" in ps_text
-    if sample_count >= 5 and has_fmax and has_fmin and spirv_bound > 400:
-        detected.append("FXAA")
-
-    # ── Bloom Threshold: sample + FMax of .xyz + subtract + clamp + multiply ──
-    has_xyz_fmax = bool(re.search(r"FMax.*\.(xy|yz|xz|xyz)", ps_text))
-    has_subtract = bool(re.search(r"\bFSub\b", ps_text)) or " - " in ps_text
-    has_clamp_zero = bool(re.search(r"FMax\(.*0\.0", ps_text)) or "FClamp" in ps_text
-    has_multiply = "FMul" in ps_text or " * " in ps_text
-    if sample_count >= 1 and has_xyz_fmax and has_subtract and has_clamp_zero and has_multiply:
-        detected.append("Bloom Threshold")
-
-    # ── Gaussian Blur: >=3 samples + offset arithmetic + weight multiplications ──
-    offset_count = len(re.findall(r"(?:FAdd|FSub).*(?:float2|float)", ps_text[:4000]))
-    mul_count = ps_text.count("FMul") + ps_text.count(" * ")
-    if sample_count >= 3 and offset_count >= 2 and mul_count >= 3:
-        # Additional check: look for repeated similar sample patterns
-        explicit_samples = ps_text.count("ImageSampleExplicitLod")
-        implicit_samples = ps_text.count("ImageSampleImplicitLod")
-        if explicit_samples >= 3 or implicit_samples >= 3:
-            detected.append("Gaussian Blur")
-
-    # ── Tonemapping: Pow instruction + (>=2 samples or matrix multiply) ──
-    has_pow = "Pow" in ps_text or "GLSL.std.450::Pow" in ps_text
-    has_matrix = bool(re.search(r"float[34]x[34]|MatrixTimesVector|VectorTimesMatrix", ps_text))
-    if has_pow and (sample_count >= 2 or has_matrix):
-        detected.append("Tonemapping")
-
+    for _name, exclusive, fn in _PATTERN_REGISTRY:
+        result = fn(ctx)
+        if result:
+            detected.append(result)
+            if exclusive:
+                return detected
     return detected
 
 
