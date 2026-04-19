@@ -33,7 +33,7 @@ from pathlib import Path
 from shared import write_json
 from rpc import run_rdc, _unwrap, Progress, ErrorCollector, MAIN_SESSION
 from workers import (
-    collect_base, collect_pass_details, _get_draw_eids,
+    collect_base, collect_pass_details, _get_draw_eids, _get_dispatch_eids,
     collect_per_draw, collect_shaders_disasm,
     collect_resource_details, collect_rt_usage,
     _shard_list, _get_resource_tasks,
@@ -156,6 +156,8 @@ def main() -> None:
         # ═══════════════════════════════════════════════════════════════
 
         draw_eids = _get_draw_eids(summary)
+        dispatch_eids = _get_dispatch_eids(summary)
+        all_action_eids = draw_eids + dispatch_eids
 
         if parallel:
             print(f"\n  Starting {num_workers} worker sessions ...")
@@ -169,11 +171,11 @@ def main() -> None:
                 parallel = False
 
         if parallel and active_workers:
-            # ── Step 4: Per-draw pipeline+bindings (parallel) ──
-            print(f"\n[Step 4] Collecting pipeline+bindings for {len(draw_eids)} draws ({len(active_workers)} workers) ...")
+            # ── Step 4: Per-draw/dispatch pipeline+bindings (parallel) ──
+            print(f"\n[Step 4] Collecting pipeline+bindings for {len(draw_eids)} draws + {len(dispatch_eids)} dispatches ({len(active_workers)} workers) ...")
             t0 = time.time()
-            shards = _shard_list(draw_eids, len(active_workers))
-            progress = Progress(len(draw_eids), "Per-draw (pipeline+bindings)")
+            shards = _shard_list(all_action_eids, len(active_workers))
+            progress = Progress(len(all_action_eids), "Per-action (pipeline+bindings)")
             all_pipelines: dict = {}
             all_bindings: dict = {}
 
@@ -319,9 +321,9 @@ def main() -> None:
 
         else:
             # ── Serial fallback (workers=1) ──
-            print(f"\n[Step 4] Collecting pipeline+bindings for {len(draw_eids)} draws ...")
+            print(f"\n[Step 4] Collecting pipeline+bindings for {len(draw_eids)} draws + {len(dispatch_eids)} dispatches ...")
             t0 = time.time()
-            pipelines, bindings = collect_per_draw(draw_eids, errors)
+            pipelines, bindings = collect_per_draw(all_action_eids, errors)
             write_json(out_dir / "pipelines.json", pipelines)
             write_json(out_dir / "bindings.json", bindings)
             timings["per_draw"] = time.time() - t0

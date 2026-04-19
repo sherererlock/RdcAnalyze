@@ -55,6 +55,10 @@ def _extract_subpasses(
         return _coarse_as_subpasses(coarse_passes, pass_details)
 
     draw_map: dict[int, dict] = {dr["eid"]: dr for dr in draws_list}
+    dispatch_eids: set[int] = {
+        e["eid"] for e in events
+        if isinstance(e, dict) and e.get("type") == "Dispatch"
+    }
 
     # ── Step 1: parse events into marker list ──
     stack: list[dict] = []
@@ -91,16 +95,22 @@ def _extract_subpasses(
                     "end_eid": None,
                     "depth": len(stack),
                     "draws": 0,
+                    "dispatches": 0,
                     "triangles": 0,
                     "_noise": False,
                 })
 
-        if eid in draw_map and noise_depth is None:
-            dr = draw_map[eid]
-            for m in stack:
-                if not m.get("_noise"):
-                    m["draws"] += 1
-                    m["triangles"] += dr.get("triangles", 0)
+        if noise_depth is None:
+            if eid in draw_map:
+                dr = draw_map[eid]
+                for m in stack:
+                    if not m.get("_noise"):
+                        m["draws"] += 1
+                        m["triangles"] += dr.get("triangles", 0)
+            elif eid in dispatch_eids:
+                for m in stack:
+                    if not m.get("_noise"):
+                        m["dispatches"] = m.get("dispatches", 0) + 1
 
     # Close any unclosed markers
     last_eid = events[-1]["eid"] if events else 0
@@ -113,7 +123,7 @@ def _extract_subpasses(
     # ── Step 2: filter to meaningful candidates ──
     candidates = [
         m for m in markers
-        if m["draws"] > 0 and m["name"] not in _BATCH_NAMES
+        if (m["draws"] > 0 or m.get("dispatches", 0) > 0) and m["name"] not in _BATCH_NAMES
     ]
 
     if not candidates:

@@ -887,6 +887,7 @@ function showTooltip(event, n) {
     </div>
     <div class="tt-grid">
       <div class="tt-row"><span class="tt-label">DRAWS</span><span class="tt-value">${n.draws}</span></div>
+      ${n.dispatches > 0 ? `<div class="tt-row"><span class="tt-label">DISPATCHES</span><span class="tt-value">${n.dispatches}</span></div>` : ''}
       <div class="tt-row"><span class="tt-label">TRIS</span><span class="tt-value">${triStr}</span></div>
       <div class="tt-row"><span class="tt-label">EID</span><span class="tt-value">${n.begin_eid || '-'}</span></div>
       <div></div>

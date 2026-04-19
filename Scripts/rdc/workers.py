@@ -81,6 +81,14 @@ def _get_draw_eids(summary: dict) -> list[int]:
     return [d["eid"] for d in draws if isinstance(d, dict) and "eid" in d]
 
 
+def _get_dispatch_eids(summary: dict) -> list[int]:
+    """Extract compute dispatch EIDs from summary.events."""
+    events = _unwrap(summary.get("events"), "events")
+    if not events or not isinstance(events, list):
+        return []
+    return [e["eid"] for e in events if isinstance(e, dict) and e.get("type") == "Dispatch"]
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Per-draw & per-resource collection
 # ─────────────────────────────────────────────────────────────────────
@@ -157,17 +165,32 @@ def collect_shaders_disasm(
             for eid in eids:
                 eid_to_shaders.setdefault(eid, {})[stage] = sid
 
+    # Separate graphics (VS/PS) pairs from compute (CS) shaders
     pair_map: dict[tuple[int, int], list[int]] = {}
+    cs_map: dict[int, list[int]] = {}
     for eid, stage_map in sorted(eid_to_shaders.items()):
+        cs = stage_map.get("cs", 0)
         vs = stage_map.get("vs", 0)
         ps = stage_map.get("ps", 0)
-        pair_map.setdefault((vs, ps), []).append(eid)
+        if cs and not vs and not ps:
+            cs_map.setdefault(cs, []).append(eid)
+        else:
+            pair_map.setdefault((vs, ps), []).append(eid)
 
     shaders_dir = out_dir / "shaders"
     shaders_dir.mkdir(exist_ok=True)
 
+    def _fetch_disasm(sid: int) -> str | None:
+        result = _rpc_call(sess_name, "shader_list_disasm", {"id": sid}, timeout=60)
+        if result and isinstance(result, dict):
+            return result.get("disasm", "")
+        return None
+
     results: dict = {}
-    prog = Progress(len(pair_map), "Shader files")
+    total_items = len(pair_map) + len(cs_map)
+    prog = Progress(total_items, "Shader files")
+
+    # Graphics VS/PS pairs
     for (vs_id, ps_id), eids in sorted(pair_map.items()):
         pair_name = f"shader_{vs_id}_{ps_id}"
         prog.tick(pair_name)
@@ -191,11 +214,7 @@ def collect_shaders_disasm(
             lines.append(f"// {'─' * 40}")
             lines.append("")
 
-            disasm_result = _rpc_call(sess_name, "shader_list_disasm", {"id": sid}, timeout=60)
-            disasm_text = None
-            if disasm_result and isinstance(disasm_result, dict):
-                disasm_text = disasm_result.get("disasm", "")
-
+            disasm_text = _fetch_disasm(sid)
             if disasm_text:
                 lines.append(disasm_text)
             else:
@@ -214,8 +233,46 @@ def collect_shaders_disasm(
             "file": rel_path,
         }
 
+    # Compute shaders
+    for cs_id, eids in sorted(cs_map.items()):
+        cs_name = f"shader_cs_{cs_id}"
+        prog.tick(cs_name)
+
+        info = infos.get(cs_id, {})
+        entry_name = info.get("entry", "main")
+
+        lines = [
+            f"// {'=' * 60}",
+            f"// Compute Shader (ID: {cs_id})  Entry: {entry_name}",
+            f"// Used by {len(eids)} dispatch(es): EID {', '.join(str(e) for e in eids[:20])}",
+        ]
+        if len(eids) > 20:
+            lines.append(f"//   ... +{len(eids) - 20} more")
+        lines.append(f"// {'=' * 60}")
+        lines.append("")
+
+        disasm_text = _fetch_disasm(cs_id)
+        if disasm_text:
+            lines.append(disasm_text)
+        else:
+            lines.append("// (disassembly unavailable)")
+            errors.append({"phase": "shader_disasm", "shader_id": cs_id, "error": "disasm failed"})
+
+        shader_file = shaders_dir / f"{cs_name}.shader"
+        shader_file.write_text("\n".join(lines), encoding="utf-8")
+
+        rel_path = f"shaders/{cs_name}.shader"
+        results[f"cs_{cs_id}"] = {
+            "cs_id": cs_id,
+            "eids": eids,
+            "uses": len(eids),
+            "file": rel_path,
+        }
+
     prog.done()
-    print(f"    Saved {len(results)} .shader files to {shaders_dir}/")
+    gfx_count = len(pair_map)
+    cs_count = len(cs_map)
+    print(f"    Saved {len(results)} .shader files ({gfx_count} graphics, {cs_count} compute) to {shaders_dir}/")
     return results
 
 

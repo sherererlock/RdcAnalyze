@@ -68,9 +68,11 @@ _fmt_number = fmt_number  # alias for local readability
 _fmt_mb = fmt_mb
 
 
-def _classify_pass(name: str) -> str:
+def _classify_pass(name: str, *, draws: int = -1, dispatches: int = -1) -> str:
     """Classify a pass by its name into a category."""
     lower = name.lower()
+    if any(k in lower for k in ("compute", "dispatch", "cs ")):
+        return "Compute"
     if any(k in lower for k in ("shadow", "shadowmap")):
         return "Shadow"
     if any(k in lower for k in ("depth", "prepass", "pre-pass", "zprepass")):
@@ -91,6 +93,8 @@ def _classify_pass(name: str) -> str:
         return "Hair"
     if any(k in lower for k in ("scriptablerenderer",)):
         return "Geometry"
+    if draws == 0 and dispatches > 0:
+        return "Compute"
     return "Other"
 
 
@@ -101,6 +105,7 @@ _PASS_CAT_COLORS = {
     "Geometry": "#22b07a",
     "Hair": "#f59e0b",
     "Transparent": "#06b6d4",
+    "Compute": "#6366f1",
     "PostProcess": "#d4a017",
     "Present": "#64748b",
     "Other": "#555f78",
@@ -140,6 +145,12 @@ def analyze_frame_overview(data: dict) -> dict:
     has_gbuffer = any("gbuffer" in n or "g-buffer" in n for n in pass_names)
     arch = "Deferred" if has_gbuffer else "Forward"
 
+    events_list = _unwrap(summary.get("events"), "events") or []
+    total_dispatches = sum(
+        1 for e in events_list
+        if isinstance(e, dict) and e.get("type") == "Dispatch"
+    )
+
     return {
         "api": info.get("API", "Unknown"),
         "platform": info.get("machine_ident", "Unknown").strip(),
@@ -147,6 +158,7 @@ def analyze_frame_overview(data: dict) -> dict:
         "events": info.get("Events", 0),
         "draw_calls": info.get("Draw Calls", ""),
         "total_draws": len(draws_list),
+        "total_dispatches": total_dispatches,
         "total_triangles": total_tri,
         "draw_types": dict(draw_types),
         "pass_count": len(passes),
@@ -159,7 +171,9 @@ def analyze_pipeline(data: dict) -> dict:
     pass_details = data.get("pass_details") or []
     result = []
     for p in pass_details:
-        cat = _classify_pass(p.get("name", ""))
+        p_draws = p.get("draws", 0)
+        p_dispatches = p.get("dispatches", 0)
+        cat = _classify_pass(p.get("name", ""), draws=p_draws, dispatches=p_dispatches)
         color_targets = p.get("color_targets") or []
         depth_target = p.get("depth_target")
         rt_info = []
@@ -285,59 +299,77 @@ def analyze_shaders(data: dict) -> dict:
     for key, info in shader_disasm.items():
         if not isinstance(info, dict):
             continue
+
+        is_compute = "cs_id" in info
         vs_id = info.get("vs_id", 0)
         ps_id = info.get("ps_id", 0)
+        cs_id = info.get("cs_id", 0)
         uses = info.get("uses", 0)
         fname = info.get("file", "")
 
-        # Parse shader file for complexity metrics
         spirv_bound = 0
         tex_samples = 0
         ubo_size = 0
         ps_lines = 0
+        buffer_accesses = 0
+
         shader_path = shaders_dir / os.path.basename(fname) if fname else None
         if shader_path and shader_path.exists():
             try:
                 content = shader_path.read_text(encoding="utf-8", errors="replace")
-                # Extract PS SPIR-V bound
-                ps_section = content.split("Pixel Shader")
-                if len(ps_section) > 1:
-                    ps_text = ps_section[1]
-                    ps_lines = ps_text.count("\n")
-                    bound_match = re.search(r"<id> bound of (\d+)", ps_text)
+                if is_compute:
+                    cs_lines = content.count("\n")
+                    ps_lines = cs_lines
+                    bound_match = re.search(r"<id> bound of (\d+)", content)
                     if bound_match:
                         spirv_bound = int(bound_match.group(1))
-                    tex_samples = ps_text.count("ImageSampleImplicitLod")
-                    tex_samples += ps_text.count("ImageSampleDrefImplicitLod")
-                    tex_samples += ps_text.count("ImageSampleExplicitLod")
-                    # UBO size
-                    ubo_match = re.search(r"UnityPerMaterial.*?Offset\((\d+)\)", ps_text, re.DOTALL)
-                    if ubo_match:
-                        # Find largest offset in UnityPerMaterial
-                        offsets = re.findall(r"Offset\((\d+)\)", ps_text[:ps_text.find("void main()")] if "void main()" in ps_text else ps_text)
-                        if offsets:
-                            ubo_size = max(int(o) for o in offsets) + 16  # approximate
+                    tex_samples = content.count("ImageSampleImplicitLod")
+                    tex_samples += content.count("ImageSampleExplicitLod")
+                    buffer_accesses = content.count("OpAccessChain")
+                    buffer_accesses += content.count("StorageBuffer")
+                else:
+                    ps_section = content.split("Pixel Shader")
+                    if len(ps_section) > 1:
+                        ps_text = ps_section[1]
+                        ps_lines = ps_text.count("\n")
+                        bound_match = re.search(r"<id> bound of (\d+)", ps_text)
+                        if bound_match:
+                            spirv_bound = int(bound_match.group(1))
+                        tex_samples = ps_text.count("ImageSampleImplicitLod")
+                        tex_samples += ps_text.count("ImageSampleDrefImplicitLod")
+                        tex_samples += ps_text.count("ImageSampleExplicitLod")
+                        ubo_match = re.search(r"UnityPerMaterial.*?Offset\((\d+)\)", ps_text, re.DOTALL)
+                        if ubo_match:
+                            offsets = re.findall(r"Offset\((\d+)\)", ps_text[:ps_text.find("void main()")] if "void main()" in ps_text else ps_text)
+                            if offsets:
+                                ubo_size = max(int(o) for o in offsets) + 16
             except Exception:
                 pass
 
-        shader_list.append({
+        entry = {
             "key": key,
-            "vs_id": vs_id,
-            "ps_id": ps_id,
+            "is_compute": is_compute,
             "uses": uses,
             "eids": info.get("eids", []),
             "spirv_bound": spirv_bound,
             "tex_samples": tex_samples,
             "ubo_size": ubo_size,
             "ps_lines": ps_lines,
-        })
+        }
+        if is_compute:
+            entry["cs_id"] = cs_id
+            entry["buffer_accesses"] = buffer_accesses
+        else:
+            entry["vs_id"] = vs_id
+            entry["ps_id"] = ps_id
+        shader_list.append(entry)
 
-    # Sort by weighted impact: uses * spirv_bound
     shader_list.sort(key=lambda s: s["uses"] * max(s["spirv_bound"], 1), reverse=True)
 
     return {
         "shaders": shader_list,
         "total_unique": len(shader_list),
+        "total_compute": sum(1 for s in shader_list if s.get("is_compute")),
     }
 
 
@@ -556,6 +588,10 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
         <div class="card-sub">{_esc(str(overview['draw_calls']))}</div>
       </div>
       <div class="card">
+        <div class="card-label">Dispatches</div>
+        <div class="card-value">{_fmt_number(overview.get('total_dispatches', 0))}</div>
+      </div>
+      <div class="card">
         <div class="card-label">Triangles</div>
         <div class="card-value">{_fmt_number(overview['total_triangles'])}</div>
       </div>
@@ -607,6 +643,7 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
             f'<td><span class="cat-dot" style="background:{p["color"]}"></span>{_esc(p["name"])}</td>'
             f'<td>{_esc(p["category"])}</td>'
             f'<td class="num">{p["draws"]}</td>'
+            f'<td class="num">{p["dispatches"]}</td>'
             f'<td class="num">{_fmt_number(p["triangles"])}</td>'
             f'<td class="num">{p["begin_eid"]}-{p["end_eid"]}</td>'
             f'<td class="rt-cell">{rt_cell}</td>'
@@ -628,7 +665,7 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     <table class="data-table sortable">
       <thead><tr>
         <th>#</th><th>Pass Name</th><th>Category</th>
-        <th>Draws</th><th>Triangles</th><th>EID Range</th><th>Render Targets</th>
+        <th>Draws</th><th>Dispatches</th><th>Triangles</th><th>EID Range</th><th>Render Targets</th>
       </tr></thead>
       <tbody>{"".join(pass_table_rows)}</tbody>
     </table>
@@ -737,9 +774,13 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     max_bound = max((s["spirv_bound"] for s in top_shaders), default=1) or 1
     for s in top_shaders:
         bound_pct = s["spirv_bound"] / max_bound * 100
+        if s.get("is_compute"):
+            shader_label = f'CS {s["cs_id"]}'
+        else:
+            shader_label = f'VS {s.get("vs_id", 0)} / PS {s.get("ps_id", 0)}'
         shader_rows.append(
             f'<tr>'
-            f'<td class="mono">VS {s["vs_id"]} / PS {s["ps_id"]}</td>'
+            f'<td class="mono">{shader_label}</td>'
             f'<td class="num">{s["uses"]}</td>'
             f'<td class="num">{_fmt_number(s["spirv_bound"])}'
             f'<div class="inline-bar" style="width:{bound_pct:.0f}%"></div></td>'
@@ -749,13 +790,17 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
             f'</tr>'
         )
 
+    cs_note = ""
+    if shaders.get("total_compute", 0) > 0:
+        cs_note = f' ({shaders["total_compute"]} compute)'
+
     shaders_html = f"""
-    <div class="card-inline">Total unique shader pairs: <strong>{shaders['total_unique']}</strong></div>
+    <div class="card-inline">Total unique shaders: <strong>{shaders['total_unique']}</strong>{cs_note}</div>
     <div class="table-wrap">
     <table class="data-table sortable">
       <thead><tr>
-        <th>Shader Pair</th><th>Uses</th><th>SPIR-V Bound (PS)</th>
-        <th>Tex Samples</th><th>PS Lines</th><th>UBO Size</th>
+        <th>Shader</th><th>Uses</th><th>SPIR-V Bound</th>
+        <th>Tex Samples</th><th>Lines</th><th>UBO Size</th>
       </tr></thead>
       <tbody>{"".join(shader_rows)}</tbody>
     </table>

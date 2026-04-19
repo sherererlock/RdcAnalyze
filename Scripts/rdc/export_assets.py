@@ -342,12 +342,19 @@ def filter_shader_disasm(
     shader_disasm: dict,
     significant_eids: set[int],
 ) -> dict:
-    """Filter shader_disasm to only pairs used by significant draws."""
+    """Filter shader_disasm to only shaders used by significant draws/dispatches.
+
+    CS shaders (key starts with 'cs_') are always included since compute
+    dispatches have no mesh significance metric.
+    """
     if not shader_disasm or not significant_eids:
         return {}
     filtered: dict = {}
     for pair_key, info in shader_disasm.items():
         if not isinstance(info, dict):
+            continue
+        if "cs_id" in info:
+            filtered[pair_key] = info
             continue
         eids = info.get("eids") or []
         if set(eids) & significant_eids:
