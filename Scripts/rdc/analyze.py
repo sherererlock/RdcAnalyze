@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from shared import (
     guess_bpp, unwrap, fmt_number, fmt_mb, rt_bytes,
     classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad,
+    detect_shader_patterns,
     STAGE_COLORS,
 )
 
@@ -457,6 +458,32 @@ def analyze_pipeline_stages(data: dict) -> dict:
         if isinstance(pp, dict):
             rw_by_name[pp.get("name", "")] = pp
 
+    # Pre-load shader content for pattern detection
+    shader_disasm = data.get("shader_disasm") or {}
+    shaders_dir: Path = data.get("shaders_dir", Path("."))
+    _shader_content_cache: dict[str, str] = {}
+    _shader_patterns_cache: dict[str, list[str]] = {}
+
+    def _get_shader_patterns(shader_key: str, info: dict) -> list[str]:
+        if shader_key in _shader_patterns_cache:
+            return _shader_patterns_cache[shader_key]
+        if shader_key not in _shader_content_cache:
+            fname = info.get("file", "")
+            shader_path = shaders_dir / os.path.basename(fname) if fname else None
+            if shader_path and shader_path.exists():
+                try:
+                    _shader_content_cache[shader_key] = shader_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except Exception:
+                    _shader_content_cache[shader_key] = ""
+            else:
+                _shader_content_cache[shader_key] = ""
+        content = _shader_content_cache[shader_key]
+        patterns = detect_shader_patterns(content) if content else []
+        _shader_patterns_cache[shader_key] = patterns
+        return patterns
+
     stages = []
     stage_times: dict[str, float] = {}
     stage_counts: dict[str, int] = {}
@@ -513,7 +540,24 @@ def analyze_pipeline_stages(data: dict) -> dict:
         ]
         is_fs = detect_fullscreen_quad(draws_in_pass, rt_w, rt_h, counters_by_eid)
 
+        rt_area = rt_w * rt_h
+        overdraw = round(ps_inv / rt_area, 2) if rt_area > 0 and ps_inv > 0 else 0.0
+
         rw = rw_by_name.get(name, {})
+
+        # Detect shader patterns for draws in this pass
+        pass_eids = set(d.get("eid", 0) for d in draws_in_pass)
+        shader_patterns: list[str] = []
+        seen_patterns: set[str] = set()
+        for skey, sinfo in shader_disasm.items():
+            if not isinstance(sinfo, dict):
+                continue
+            shader_eids = set(sinfo.get("eids", []))
+            if shader_eids & pass_eids:
+                for pat in _get_shader_patterns(skey, sinfo):
+                    if pat not in seen_patterns:
+                        shader_patterns.append(pat)
+                        seen_patterns.add(pat)
 
         stages.append({
             "pass_name": name,
@@ -528,9 +572,11 @@ def analyze_pipeline_stages(data: dict) -> dict:
             "gpu_time_us": round(gpu_time_us, 1),
             "ps_invocations": ps_inv,
             "is_fullscreen": is_fs,
+            "overdraw": overdraw,
             "rt_width": rt_w,
             "rt_height": rt_h,
             "rt_format": rt_fmt,
+            "shader_patterns": shader_patterns,
             "writes_to": rw.get("writes") or [],
             "reads_from": rw.get("reads") or [],
         })
@@ -661,6 +707,69 @@ def generate_suggestions(analysis: dict, data: dict) -> list[dict]:
             ),
             "category": "Bandwidth",
         })
+
+    # 8–12. Stage-aware suggestions
+    pstages = analysis.get("pipeline_stages") or {}
+    stage_groups = pstages.get("stage_groups") or []
+    stage_list = pstages.get("stages") or []
+    bloom_info = pstages.get("bloom_chain")
+    total_gpu = pstages.get("total_gpu_time_us", 0)
+
+    for g in stage_groups:
+        pct = g.get("pct", 0)
+        if pct > 35 and g["stage"] == "Compute":
+            suggestions.append({
+                "severity": "warning",
+                "title": f"Compute dominates GPU time ({pct:.0f}%)",
+                "detail": (
+                    f"Compute dispatches consume {g['gpu_time_us']:.0f} us ({pct:.0f}% of frame). "
+                    "Check workgroup size, occupancy, and whether all dispatches are necessary."
+                ),
+                "category": "Compute",
+            })
+        if pct > 25 and g["stage"] == "Compositing" and g["passes"] >= 3:
+            suggestions.append({
+                "severity": "info",
+                "title": f"Compositing uses {g['passes']} separate passes ({pct:.0f}%)",
+                "detail": (
+                    f"{g['passes']} compositing passes across multiple queue submits. "
+                    "If not required by synchronization, merging into fewer passes "
+                    "reduces submit overhead and render pass transitions."
+                ),
+                "category": "Compositing",
+            })
+
+    if bloom_info and bloom_info.get("detected"):
+        n_bloom = len(bloom_info.get("passes", []))
+        bloom_gpu = sum(
+            s["gpu_time_us"] for s in stage_list if s["stage"] == "Bloom"
+        )
+        bloom_pct = (bloom_gpu / total_gpu * 100) if total_gpu > 0 else 0
+        if bloom_pct > 15:
+            suggestions.append({
+                "severity": "info",
+                "title": f"Bloom chain: {n_bloom} passes, {bloom_gpu:.0f} us ({bloom_pct:.0f}%)",
+                "detail": (
+                    f"Bloom uses {bloom_info.get('levels', 0)} downsample levels. "
+                    "Consider compute-shader bloom (single dispatch per level) "
+                    "or reducing levels to cut render pass overhead."
+                ),
+                "category": "PostProcess",
+            })
+
+    for s in stage_list:
+        od = s.get("overdraw", 0)
+        if od > 4.0 and s["stage"] not in ("Bloom", "PostProcess", "Compositing"):
+            suggestions.append({
+                "severity": "warning",
+                "title": f"High overdraw {od:.1f}x in {s['pass_name']}",
+                "detail": (
+                    f"Pass '{s['pass_name']}' ({s['stage']}) has {od:.1f}x overdraw. "
+                    "Check draw order (front-to-back), early-Z effectiveness, "
+                    "or whether alpha-tested/transparent draws are mixed with opaques."
+                ),
+                "category": "Overdraw",
+            })
 
     # Sort: warning first, then info
     severity_order = {"critical": 0, "warning": 1, "info": 2}
@@ -849,6 +958,20 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     stage_table_rows = []
     for i, s in enumerate(stage_list):
         fs_tag = '<span class="tag tag-fs">FS</span>' if s.get("is_fullscreen") else ""
+        pattern_tags = "".join(
+            f'<span class="tag tag-pattern">{_esc(p)}</span>'
+            for p in s.get("shader_patterns", [])
+        )
+        od = s.get("overdraw", 0.0)
+        if od > 8.0:
+            od_style = 'color:#ef4444;font-weight:600'
+        elif od > 4.0:
+            od_style = 'color:#f97316;font-weight:600'
+        elif od > 2.0:
+            od_style = 'color:#eab308'
+        else:
+            od_style = ''
+        od_cell = f'<td class="num" style="{od_style}">{od:.2f}</td>' if od > 0 else '<td class="num">-</td>'
         stage_table_rows.append(
             f'<tr>'
             f'<td>{i}</td>'
@@ -859,7 +982,8 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
             f'<td class="num">{s["gpu_time_us"]:.0f}</td>'
             f'<td class="num">{_fmt_number(s["ps_invocations"])}</td>'
             f'<td class="num">{s["rt_width"]}x{s["rt_height"]}</td>'
-            f'<td>{_esc(s["rt_format"])}{fs_tag}</td>'
+            f'<td>{_esc(s["rt_format"])}{fs_tag}{pattern_tags}</td>'
+            f'{od_cell}'
             f'</tr>'
         )
 
@@ -909,7 +1033,7 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     <table class="data-table sortable">
       <thead><tr>
         <th>#</th><th>Pass Name</th><th>Stage</th><th>Reason</th>
-        <th>GPU (us)</th><th>PS Invocations</th><th>RT Size</th><th>Format</th>
+        <th>GPU (us)</th><th>PS Invocations</th><th>RT Size</th><th>Format</th><th>OD</th>
       </tr></thead>
       <tbody>{"".join(stage_table_rows)}</tbody>
     </table>
@@ -1411,6 +1535,17 @@ body::before {{
   background: var(--accent-cyan);
   color: var(--bg-base);
   margin-left: 6px;
+}}
+.tag-pattern {{
+  display: inline-block;
+  background: #6366f120;
+  color: #6366f1;
+  border: 1px solid #6366f140;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  margin-left: 4px;
 }}
 
 /* ── Bloom chain ── */

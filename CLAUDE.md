@@ -14,7 +14,8 @@ RdcAnalyze is a GPU frame analysis toolkit that wraps **rdc-cli** (a CLI for Ren
 Scripts/rdc/          # Main analysis scripts (the code you'll edit most)
   collect.py          # Phase 1: automated data collection from .rdc captures via rdc-cli
   analyze.py          # Phase 2: generates interactive HTML performance report from collected JSON
-  shared.py           # Shared utilities (BPP tables, format helpers, JSON I/O)
+  tsv_export.py       # TSV table generation (called by collect.py)
+  shared.py           # Shared utilities (BPP tables, format helpers, stage classification)
 Scripts/rdc-report.bat  # One-command pipeline: collect → analyze
 
 rdc-portable/         # Portable RenderDoc (binaries + Python bindings, checked in)
@@ -64,17 +65,20 @@ rdc-portable\rdc.bat close
     bindings.tsv    # Per-binding: eid, stage, kind, set, slot, resource name
     resources.tsv   # All resources: textures + buffers unified
     shaders.tsv     # Shader pairs: vs/ps/cs IDs, usage count, eid list
+    pipeline_stages.tsv  # Auto-classified stage per pass (Compute/ShadowMap/MainColor/Bloom/UI/...)
+    stage_summary.tsv    # GPU time distribution by stage type
   shaders/          # .shader disassembly files
   render_graph.html
 ```
 
-**Phase 2 — `analyze.py`**: Reads the `*-analysis/json/` files and generates `performance_report.html` with sections: Frame Overview, Rendering Pipeline (Gantt + table), Triangle Hotspots, Bandwidth Estimation, Shader Complexity, Memory, and Optimization Suggestions.
+**Phase 2 — `analyze.py`**: Reads the `*-analysis/json/` files and generates `performance_report.html` with sections: Frame Overview, Rendering Pipeline (Gantt + table), Pipeline Stage Analysis (auto-classification + GPU time breakdown + bloom chain detection), Triangle Hotspots, Bandwidth Estimation, Shader Complexity, Memory, and Optimization Suggestions.
 
 ### Key Patterns
 
 - **rdc-cli daemon**: `collect.py` communicates with rdc-cli via subprocess calls (`run_rdc()` / `run_rdc_json()`) and direct JSON-RPC socket calls (`_rpc_call()`) for long-running operations like shader cache builds.
 - **WorkerPool**: Manages parallel daemon sessions (`rdc-collect-w0..wN`) for concurrent per-draw and resource data collection.
 - **Render Graph**: `_extract_subpasses()` builds fine-grained sub-pass nodes from event marker hierarchy, then `_build_dependency_edges()` infers RT data flow using multiple strategies (explicit deps → per-pass reads/writes → RT usage events → descriptors → name similarity → unconsumed RT propagation).
+- **Pipeline Stage Classification** (`shared.py`): Two-tier heuristic — (1) engine-provided pass name keywords (shadow, gbuffer, bloom, fxaa…), (2) metadata fallback for RenderDoc auto-generated names (RT format/size, load ops, draw characteristics). Includes `detect_bloom_chain()` (progressive ½ resolution downsample-upsample detection) and `detect_fullscreen_quad()` (tri≤2 + PS invocations ≈ RT pixels).
 - **HTML reports** reference shared CSS from an `assets/` directory via relative path (`__ASSETS__` placeholder replaced at generation time).
 
 ## Important Constraints

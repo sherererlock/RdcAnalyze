@@ -586,6 +586,82 @@ def detect_fullscreen_quad(
     return len(draws_in_pass) <= 2
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Shader pattern recognition (SPIR-V disassembly heuristics)
+# ─────────────────────────────────────────────────────────────────────
+
+def detect_shader_patterns(shader_content: str) -> list[str]:
+    """Detect common shader algorithm patterns from SPIR-V disassembly.
+
+    Analyzes only the Pixel Shader section. Returns list of detected
+    pattern names (e.g. ["FXAA", "Dithering"]).
+    """
+    # Extract pixel shader section only
+    parts = shader_content.split("Pixel Shader")
+    if len(parts) < 2:
+        return []
+    ps_text = parts[1]
+
+    # Parse SPIR-V bound
+    bound_match = re.search(r"<id> bound of (\d+)", ps_text)
+    spirv_bound = int(bound_match.group(1)) if bound_match else 0
+
+    # Count texture sample operations
+    sample_count = (
+        ps_text.count("ImageSampleImplicitLod")
+        + ps_text.count("ImageSampleExplicitLod")
+        + ps_text.count("ImageSampleDrefImplicitLod")
+    )
+
+    detected: list[str] = []
+
+    # ── Fullscreen Blit: single sample + very short shader ──
+    if sample_count == 1 and spirv_bound < 50:
+        detected.append("Fullscreen Blit")
+        return detected  # mutually exclusive with complex patterns
+
+    # ── Dithering: SpecId + FragCoord + bit ops (& 1, << 1) + Round ──
+    has_specid = "SpecId" in ps_text
+    has_fragcoord = "FragCoord" in ps_text
+    has_bit_and1 = bool(re.search(r"& 1\b", ps_text))
+    has_bit_shl1 = bool(re.search(r"<< 1\b", ps_text))
+    has_round = "Round" in ps_text
+    if has_specid and has_fragcoord and has_bit_and1 and has_bit_shl1 and has_round:
+        detected.append("Dithering")
+
+    # ── FXAA: >=5 ImageSample* + FMax + FMin on same channel + large shader ──
+    has_fmax = "FMax" in ps_text or "GLSL.std.450::FMax" in ps_text
+    has_fmin = "FMin" in ps_text or "GLSL.std.450::FMin" in ps_text
+    if sample_count >= 5 and has_fmax and has_fmin and spirv_bound > 400:
+        detected.append("FXAA")
+
+    # ── Bloom Threshold: sample + FMax of .xyz + subtract + clamp + multiply ──
+    has_xyz_fmax = bool(re.search(r"FMax.*\.(xy|yz|xz|xyz)", ps_text))
+    has_subtract = bool(re.search(r"\bFSub\b", ps_text)) or " - " in ps_text
+    has_clamp_zero = bool(re.search(r"FMax\(.*0\.0", ps_text)) or "FClamp" in ps_text
+    has_multiply = "FMul" in ps_text or " * " in ps_text
+    if sample_count >= 1 and has_xyz_fmax and has_subtract and has_clamp_zero and has_multiply:
+        detected.append("Bloom Threshold")
+
+    # ── Gaussian Blur: >=3 samples + offset arithmetic + weight multiplications ──
+    offset_count = len(re.findall(r"(?:FAdd|FSub).*(?:float2|float)", ps_text[:4000]))
+    mul_count = ps_text.count("FMul") + ps_text.count(" * ")
+    if sample_count >= 3 and offset_count >= 2 and mul_count >= 3:
+        # Additional check: look for repeated similar sample patterns
+        explicit_samples = ps_text.count("ImageSampleExplicitLod")
+        implicit_samples = ps_text.count("ImageSampleImplicitLod")
+        if explicit_samples >= 3 or implicit_samples >= 3:
+            detected.append("Gaussian Blur")
+
+    # ── Tonemapping: Pow instruction + (>=2 samples or matrix multiply) ──
+    has_pow = "Pow" in ps_text or "GLSL.std.450::Pow" in ps_text
+    has_matrix = bool(re.search(r"float[34]x[34]|MatrixTimesVector|VectorTimesMatrix", ps_text))
+    if has_pow and (sample_count >= 2 or has_matrix):
+        detected.append("Tonemapping")
+
+    return detected
+
+
 def _renumber_deduped(passes: list[dict]) -> None:
     """Renumber passes per-type after dedup removed old-frame passes."""
     counters: dict[str, int] = {}

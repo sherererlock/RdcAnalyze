@@ -9,6 +9,7 @@ from collections import Counter
 from pathlib import Path
 
 from rpc import _unwrap
+from shared import classify_pass_stage, detect_bloom_chain, STAGE_COLORS
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -719,6 +720,23 @@ def generate_render_graph_html(
         graph_json = json.dumps({"nodes": [], "edges": []})
         return template.replace("/*GRAPH_DATA*/", graph_json).replace("__ASSETS__", assets_rel)
 
+    bloom = detect_bloom_chain(pass_details)
+    bloom_names: set[str] = set(bloom["passes"]) if bloom else set()
+    max_rt_area = 0
+    for p in pass_details:
+        for ct in (p.get("color_targets") or []):
+            area = ct.get("width", 0) * ct.get("height", 0)
+            if area > max_rt_area:
+                max_rt_area = area
+
+    stage_by_pass_idx: dict[int, str] = {}
+    for pi, p in enumerate(pass_details):
+        stage, _ = classify_pass_stage(
+            p, all_passes=pass_details,
+            bloom_pass_names=bloom_names, max_rt_area=max_rt_area,
+        )
+        stage_by_pass_idx[pi] = stage
+
     max_tri = max((sp.get("triangles", 0) for sp in subpasses), default=1) or 1
     nodes = []
     for i, sp in enumerate(subpasses):
@@ -742,16 +760,21 @@ def generate_render_graph_html(
                 "format": depth_target.get("format", ""),
             }
 
+        pass_idx = sp.get("pass_idx")
+        stage = stage_by_pass_idx.get(pass_idx, "Other") if pass_idx is not None else "Other"
+
         nodes.append({
             "id": i,
             "name": sp.get("display_name") or sp.get("name", f"Pass #{i}"),
             "draws": draws,
             "dispatches": dispatches,
             "triangles": tri,
-            "pass_idx": sp.get("pass_idx"),
+            "pass_idx": pass_idx,
             "begin_eid": sp.get("begin_eid", 0),
             "color_targets": ct_list,
             "depth_target": dt,
+            "stage": stage,
+            "stageColor": STAGE_COLORS.get(stage, "#555f78"),
         })
 
     edge_data = _build_dependency_edges(subpasses, nodes, summary, rt_usage)

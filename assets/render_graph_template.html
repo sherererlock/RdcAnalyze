@@ -560,9 +560,14 @@ function heatColorHex(tri, maxTri) {
 
 const maxTri = Math.max(...nodes.map(n => n.triangles), 1);
 
-// Recolor nodes with thermal palette
+// Recolor nodes — prefer stage color if available, fall back to thermal palette
 nodes.forEach(n => {
-  if (n.dispatches > 0 && n.draws === 0) {
+  if (n.stageColor) {
+    n.color = n.stageColor;
+    if (n.dispatches > 0 && n.draws === 0) n.nodeType = "compute";
+    else if (n.triangles === 0 && n.draws === 0) n.nodeType = "empty";
+    else n.nodeType = "draw";
+  } else if (n.dispatches > 0 && n.draws === 0) {
     n.color = "#6366f1";
     n.nodeType = "compute";
   } else if (n.triangles === 0 && n.draws === 0) {
@@ -890,6 +895,7 @@ function showTooltip(event, n) {
       ${n.dispatches > 0 ? `<div class="tt-row"><span class="tt-label">DISPATCHES</span><span class="tt-value">${n.dispatches}</span></div>` : ''}
       <div class="tt-row"><span class="tt-label">TRIS</span><span class="tt-value">${triStr}</span></div>
       <div class="tt-row"><span class="tt-label">EID</span><span class="tt-value">${n.begin_eid || '-'}</span></div>
+      ${n.stage ? `<div class="tt-row"><span class="tt-label">STAGE</span><span class="tt-value" style="color:${n.stageColor || 'inherit'}">${n.stage}</span></div>` : ''}
       <div></div>
       ${ctHtml}
       ${dtHtml}

@@ -276,7 +276,7 @@ def _build_pipeline_stages(
     stage_headers = [
         "pass_name", "stage", "reason", "begin_eid", "end_eid",
         "draws", "dispatches", "triangles",
-        "gpu_time_us", "ps_invocations", "is_fullscreen",
+        "gpu_time_us", "ps_invocations", "is_fullscreen", "overdraw",
         "rt_width", "rt_height", "rt_format",
         "writes_to", "reads_from",
     ]
@@ -321,6 +321,9 @@ def _build_pipeline_stages(
         ]
         is_fs = detect_fullscreen_quad(draws_in_pass, rt_w, rt_h, counters_by_eid)
 
+        rt_area = rt_w * rt_h
+        overdraw = round(ps_inv / rt_area, 2) if rt_area > 0 and ps_inv > 0 else 0.0
+
         rw = rw_by_name.get(name, {})
         writes = rw.get("writes") or []
         reads = rw.get("reads") or []
@@ -328,7 +331,7 @@ def _build_pipeline_stages(
         stage_rows.append([
             name, stage, reason, begin_eid, end_eid,
             p.get("draws", 0), p.get("dispatches", 0), p.get("triangles", 0),
-            round(gpu_time_us, 1), ps_inv, is_fs,
+            round(gpu_time_us, 1), ps_inv, is_fs, overdraw,
             rt_w, rt_h, rt_fmt,
             ",".join(str(r) for r in writes),
             ",".join(str(r) for r in reads),
@@ -347,6 +350,36 @@ def _build_pipeline_stages(
         ])
 
     return stage_headers, stage_rows, summary_headers, summary_rows
+
+
+def _build_draw_timing(
+    summary: dict,
+    pass_details: list[dict],
+    counters_by_eid: dict[int, dict] | None = None,
+) -> tuple[list[str], list[list]]:
+    """Build draw_timing.tsv: per-draw GPU timing sorted by duration descending."""
+    headers = ["eid", "gpu_duration_us", "ps_invocations", "vs_invocations", "triangles", "type", "pass"]
+    draws = _unwrap(summary.get("draws"), "draws") or []
+    rows = []
+    for d in draws:
+        if not isinstance(d, dict):
+            continue
+        eid = d.get("eid", 0)
+        cdata = (counters_by_eid or {}).get(eid, {})
+        gpu_dur_us = round(cdata.get("GPU Duration", 0.0) * 1e6, 2)
+        ps_inv = int(cdata.get("PS Invocations", 0))
+        vs_inv = int(cdata.get("VS Invocations", 0))
+        rows.append([
+            eid,
+            gpu_dur_us,
+            ps_inv,
+            vs_inv,
+            d.get("triangles", 0),
+            d.get("type", ""),
+            d.get("pass", ""),
+        ])
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return headers, rows
 
 
 def _build_counters_by_eid(summary: dict) -> dict[int, dict]:
@@ -398,6 +431,10 @@ def export_tsv(
         tables["pipeline_stages"] = (sh, sr)
     if sumh:
         tables["stage_summary"] = (sumh, sumr)
+
+    dth, dtr = _build_draw_timing(summary, pass_details, counters_by_eid)
+    if dth:
+        tables["draw_timing"] = (dth, dtr)
 
     written = 0
     for name, (headers, rows) in tables.items():

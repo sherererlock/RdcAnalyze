@@ -28,7 +28,8 @@ Scripts/
 └── rdc/
     ├── collect.py          # 主控: 解析参数, 编排采集步骤, 输出 JSON
     ├── analyze.py          # 读取 JSON, 生成 performance_report.html
-    ├── shared.py           # BPP 表, 格式化, JSON I/O
+    ├── tsv_export.py       # TSV 表生成 (collect.py 调用)
+    ├── shared.py           # BPP 表, 格式化, JSON I/O, 管线阶段分类
     ├── rpc.py              # rdc-cli 子进程调用 + JSON-RPC 直连
     ├── workers.py          # 数据采集函数 + WorkerPool 并行框架
     ├── computed.py         # 三角形分布 / 内存估算 / 管线去重 / 告警
@@ -42,7 +43,8 @@ Scripts/
 | 层 | 模块 | 职责 |
 |----|------|------|
 | 通信 | `rpc.py` | 封装 rdc-cli 子进程调用和 JSON-RPC socket 直连 |
-| 公共 | `shared.py` | 格式化、BPP 估算、JSON I/O |
+| 公共 | `shared.py` | 格式化、BPP 估算、JSON I/O、管线阶段分类 |
+| TSV 导出 | `tsv_export.py` | token 高效的 TSV 表生成（供 LLM/脚本消费） |
 | 采集 | `workers.py` | 各阶段采集函数 + 并行 Worker 框架 |
 | 计算 | `computed.py` | 离线分析算法 (无 I/O) |
 | 可视化 | `analyze.py`, `render_graph.py` | HTML 报告 / 依赖图生成 |
@@ -146,7 +148,7 @@ python\python.exe Scripts\rdc\analyze.py <analysis-dir>
 
 ### 输出
 
-`{analysis-dir}/performance_report.html` — 包含 7 个可折叠章节的交互式性能报告。
+`{analysis-dir}/performance_report.html` — 包含 8 个可折叠章节的交互式性能报告。
 
 ### 分析模块
 
@@ -185,6 +187,39 @@ Pass 分类与时间线数据。每个 Pass 标记类别（Shadow / DepthPrepass
 | PostProcess | `#d4a017` | post, bloom, fxaa, motion |
 | Present | `#64748b` | present, blit |
 | Other | `#555f78` | 未匹配时的默认类别 |
+
+#### `analyze_pipeline_stages(data) → dict`
+
+管线阶段自动分类。采用两级启发式策略：
+
+1. **名称关键词匹配**（引擎命名的 Pass，如 "ShadowPass"、"GBuffer"）
+2. **元数据启发式**（RenderDoc 自动生成名称如 "Colour Pass #1" 时 fallback）
+
+元数据分类规则（按优先级）:
+
+| 规则 | 判定条件 | 阶段 |
+|------|----------|------|
+| Compute | dispatches > 0, draws == 0 | Compute |
+| ShadowMap | depth-only + D16/D32 + 2^n 尺寸 | ShadowMap |
+| DepthPrepass | depth-only + 非 2^n 尺寸 | DepthPrepass |
+| Bloom | `detect_bloom_chain()` 识别的连续 pass | Bloom |
+| UI | SRGB + Clear + draws ≥ 3 + avg tri < 500 | UI |
+| Compositing | 写入最大 UNORM RT + tri ≤ 2 | Compositing |
+| PostProcess | 单全屏 quad (tri ≤ 2) | PostProcess |
+| MainColor | color+depth + Clear + draws ≥ 5 | MainColor |
+
+附加检测:
+
+- **Bloom 金字塔检测** (`detect_bloom_chain()`): 扫描连续同格式 pass，检测 ½ 降采样 / ×2 升采样 / 回到原始分辨率的序列
+- **全屏 Quad 检测** (`detect_fullscreen_quad()`): 所有 draw 的 tri ≤ 2 且 PS invocations ≈ RT 像素数
+- **GPU 时间聚合**: 从 counters 的 `GPU Duration` 按 EID 范围归属 pass 后求和
+
+| 返回键 | 类型 | 说明 |
+|--------|------|------|
+| `stages` | list[dict] | 每个 pass 的分类结果 (stage, reason, gpu_time_us, is_fullscreen 等) |
+| `stage_groups` | list[dict] | 按 stage 分组汇总 (gpu_time_us, pct) |
+| `bloom_chain` | dict\|None | Bloom 金字塔检测结果 (levels, resolutions, directions) |
+| `total_gpu_time_us` | float | 全帧 GPU 时间 |
 
 #### `analyze_hotspots(summary, pass_details) → dict`
 
@@ -236,15 +271,16 @@ Shader 复杂度排名：
 
 ### HTML 报告结构
 
-报告包含 7 个可折叠章节：
+报告包含 8 个可折叠章节：
 
 1. **Frame Overview** — 信息卡片（API、分辨率、Draw Call、三角形等）
 2. **Rendering Pipeline** — Gantt 时间线图 + Pass 详情表
-3. **Triangle Hotspots** — 热点条形图 + 重复 Mesh 表
-4. **Bandwidth Estimation** — 逐 Pass 带宽条形图
-5. **Shader Complexity** — Shader 对排行表格
-6. **Memory** — 资源大小排行 + 格式分布
-7. **Optimization Suggestions** — 带严重度图标的建议卡片
+3. **Pipeline Stage Analysis** — GPU 时间按阶段分布条形图 + Bloom 金字塔可视化 + Pass 分类表（stage / reason / GPU time / fullscreen 标记）
+4. **Triangle Hotspots** — 热点条形图 + 重复 Mesh 表
+5. **Bandwidth Estimation** — 逐 Pass 带宽条形图
+6. **Shader Complexity** — Shader 对排行表格
+7. **Memory** — 资源大小排行 + 格式分布
+8. **Optimization Suggestions** — 带严重度图标的建议卡片
 
 CSS 从 `assets/rdc-common.css` 加载，通过 `__ASSETS__` 占位符替换为相对路径。
 
@@ -308,9 +344,61 @@ fmt_mb(0.3)    # → "307 KB"
 
 估算单个 Render Target 一次读写的字节数（`width × height × bpp / 8`）。
 
+### 管线阶段分类
+
+#### `classify_pass_stage(p, *, all_passes, bloom_pass_names, max_rt_area) → tuple[str, str]`
+
+元数据驱动的 Pass 分类。根据 RT 格式/尺寸、load ops、draw 特征判断管线阶段。返回 `(stage_name, reason)`。
+
+#### `detect_bloom_chain(pass_details) → dict | None`
+
+检测连续同格式 pass 中的降采样-升采样金字塔结构。要求 ≥2 个 down + ≥1 个 up，支持最后一步直接跳回原始分辨率的 composite。
+
+#### `detect_fullscreen_quad(draws_in_pass, rt_width, rt_height, counters_by_eid) → bool`
+
+判断 pass 内所有 draw 是否为全屏 quad（tri ≤ 2 且 PS invocations ≈ RT 像素数，容差 20%）。
+
 ### 常量
 
 - **`BPP_TABLE`**: 57 条 GPU 格式 → BPP 映射表，覆盖 RGBA、BC 压缩、ASTC、D/S 等格式。
+- **`STAGE_COLORS`**: 管线阶段 → 色值映射，用于 HTML 报告中的阶段标签和条形图。
+
+---
+
+## tsv_export.py — TSV 表生成
+
+被 `collect.py` 在 Step 7.5 调用，将采集数据导出为 token 高效的 TSV 格式（供 LLM/AI 分析）。
+
+### 主函数
+
+#### `export_tsv(tsv_dir, summary, pass_details, pipelines, bindings, resource_details, shader_disasm, computed) → None`
+
+导出 13 张 TSV 表到 `tsv/` 目录。
+
+### 输出文件
+
+| 文件 | 说明 |
+|------|------|
+| `frame_info.tsv` | 帧概要键值对 |
+| `passes.tsv` | Pass 概览 (name, eid, draws, RT formats, load/store ops) |
+| `draws.tsv` | 逐 Draw Call (eid, type, triangles, pipeline IDs) |
+| `bindings.tsv` | 逐绑定 (eid, stage, kind, set, slot, name) |
+| `resources.tsv` | 所有纹理+缓冲区 (id, format, size) |
+| `shaders.tsv` | Shader 对 (vs/ps/cs IDs, uses, eids) |
+| `counters.tsv` | GPU 硬件计数器 (eid, counter, value, unit) |
+| `events.tsv` | 事件列表 (eid, type, name) |
+| `deps.tsv` | Pass 依赖边 (src, dst, resources) |
+| `pass_rw.tsv` | Pass 读写资源 (pass, reads, writes) |
+| `alerts.tsv` | 告警 (severity, type, eid, detail) |
+| `pipeline_stages.tsv` | 管线阶段分类 (pass, stage, reason, gpu_time, fullscreen) |
+| `stage_summary.tsv` | 阶段汇总 (stage, passes, gpu_time_us, pct) |
+
+### 格式约定
+
+- Tab 分隔，UTF-8 编码
+- 数组值逗号分隔（如 `eids: "1,2,3"`）
+- None → 空字符串，bool → `"1"/"0"`
+- 复杂值用 compact JSON
 
 ---
 
