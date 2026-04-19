@@ -42,6 +42,7 @@ from workers import (
 )
 from computed import compute_analysis
 from render_graph import generate_render_graph_html
+from tsv_export import export_tsv
 from export_assets import (
     collect_meshes, collect_textures, collect_draw_texture_ids,
     filter_shader_disasm, _dedup_meshes,
@@ -84,6 +85,10 @@ def main() -> None:
 
     out_dir = capture.parent / f"{capture.stem}-analysis"
     out_dir.mkdir(exist_ok=True)
+    json_dir = out_dir / "json"
+    json_dir.mkdir(exist_ok=True)
+    tsv_dir = out_dir / "tsv"
+    tsv_dir.mkdir(exist_ok=True)
     print(f"RDC Collect v{VERSION}")
     print(f"Capture: {capture}")
     print(f"Output:  {out_dir}")
@@ -131,14 +136,14 @@ def main() -> None:
             "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "version": VERSION,
         }
-        write_json(out_dir / "summary.json", summary)
+        write_json(json_dir / "summary.json", summary)
         timings["base"] = time.time() - t0
 
         # ── Step 3: Pass details ──
         print("\n[Step 3] Collecting pass details ...")
         t0 = time.time()
         pass_details = collect_pass_details(summary, errors, session=sess)
-        write_json(out_dir / "pass_details.json", pass_details)
+        write_json(json_dir / "pass_details.json", pass_details)
         timings["pass_details"] = time.time() - t0
 
         # ── Step 3.1: Sync pass names + dedup ──
@@ -147,8 +152,8 @@ def main() -> None:
             if isinstance(sp, dict) and isinstance(pd, dict):
                 sp["name"] = pd["name"]
         summary, pass_details = dedup_frames(summary, pass_details)
-        write_json(out_dir / "summary.json", summary)
-        write_json(out_dir / "pass_details.json", pass_details)
+        write_json(json_dir / "summary.json", summary)
+        write_json(json_dir / "pass_details.json", pass_details)
 
         # ── Step 3.5: RT resource usage (for dependency graph) ──
         print("\n[Step 3.5] Collecting render target usage ...")
@@ -157,7 +162,7 @@ def main() -> None:
         rt_usage = collect_rt_usage(
             pass_details, errors, session=rt_sess, summary=summary,
         )
-        write_json(out_dir / "rt_usage.json", rt_usage)
+        write_json(json_dir / "rt_usage.json", rt_usage)
         timings["rt_usage"] = time.time() - t0
 
         # ═══════════════════════════════════════════════════════════════
@@ -206,8 +211,8 @@ def main() -> None:
 
             progress.done()
             pipelines, bindings = all_pipelines, all_bindings
-            write_json(out_dir / "pipelines.json", pipelines)
-            write_json(out_dir / "bindings.json", bindings)
+            write_json(json_dir / "pipelines.json", pipelines)
+            write_json(json_dir / "bindings.json", bindings)
             timings["per_draw"] = time.time() - t0
 
             # ── Step 5: Shader disassembly (on main session — cache is per-session) ──
@@ -216,7 +221,7 @@ def main() -> None:
             shader_disasm = collect_shaders_disasm(
                 out_dir, errors, session=MAIN_SESSION,
             )
-            write_json(out_dir / "shader_disasm.json", shader_disasm)
+            write_json(json_dir / "shader_disasm.json", shader_disasm)
             timings["shader_disasm"] = time.time() - t0
 
             # ── Step 6: Resource details (parallel) ──
@@ -243,7 +248,7 @@ def main() -> None:
 
             res_progress.done()
             resource_details = all_resource_details
-            write_json(out_dir / "resource_details.json", resource_details)
+            write_json(json_dir / "resource_details.json", resource_details)
             timings["resource_details"] = time.time() - t0
 
             # ── Step 6.5: Mesh & Texture export (parallel, opt-in) ──
@@ -274,14 +279,14 @@ def main() -> None:
                 deduped = _dedup_meshes(all_meshes, out_dir / "meshes")
                 if deduped:
                     print(f"    Deduplicated {deduped} meshes")
-                write_json(out_dir / "meshes.json", all_meshes)
+                write_json(json_dir / "meshes.json", all_meshes)
                 timings["mesh_export"] = time.time() - t0
 
                 significant_eids = {int(eid) for eid in all_meshes}
 
                 # Filter shaders to significant draws
                 filtered_shaders = filter_shader_disasm(shader_disasm, significant_eids)
-                write_json(out_dir / "exported_shaders.json", filtered_shaders)
+                write_json(json_dir / "exported_shaders.json", filtered_shaders)
                 print(f"    Shaders: {len(filtered_shaders)}/{len(shader_disasm)} pairs for significant draws")
 
                 # Texture IDs from significant draws
@@ -320,7 +325,7 @@ def main() -> None:
                             errors.append({"phase": "texture_export", "error": str(exc)})
 
                 tex_progress.done()
-                write_json(out_dir / "textures.json", all_textures)
+                write_json(json_dir / "textures.json", all_textures)
                 timings["texture_export"] = time.time() - t0
 
             # Close worker sessions
@@ -333,20 +338,20 @@ def main() -> None:
             print(f"\n[Step 4] Collecting pipeline+bindings for {len(draw_eids)} draws + {len(dispatch_eids)} dispatches ...")
             t0 = time.time()
             pipelines, bindings = collect_per_draw(all_action_eids, errors)
-            write_json(out_dir / "pipelines.json", pipelines)
-            write_json(out_dir / "bindings.json", bindings)
+            write_json(json_dir / "pipelines.json", pipelines)
+            write_json(json_dir / "bindings.json", bindings)
             timings["per_draw"] = time.time() - t0
 
             print("\n[Step 5] Collecting shader disassembly ...")
             t0 = time.time()
             shader_disasm = collect_shaders_disasm(out_dir, errors)
-            write_json(out_dir / "shader_disasm.json", shader_disasm)
+            write_json(json_dir / "shader_disasm.json", shader_disasm)
             timings["shader_disasm"] = time.time() - t0
 
             print("\n[Step 6] Collecting resource details ...")
             t0 = time.time()
             resource_details = collect_resource_details(summary, errors)
-            write_json(out_dir / "resource_details.json", resource_details)
+            write_json(json_dir / "resource_details.json", resource_details)
             timings["resource_details"] = time.time() - t0
 
             # ── Step 6.5: Mesh & Texture export (serial, opt-in) ──
@@ -354,12 +359,12 @@ def main() -> None:
                 print(f"\n[Step 6.5a] Exporting meshes for {len(draw_eids)} draws ...")
                 t0 = time.time()
                 meshes, significant_eids = collect_meshes(draw_eids, out_dir, errors)
-                write_json(out_dir / "meshes.json", meshes)
+                write_json(json_dir / "meshes.json", meshes)
                 timings["mesh_export"] = time.time() - t0
 
                 # Filter shaders to significant draws
                 filtered_shaders = filter_shader_disasm(shader_disasm, significant_eids)
-                write_json(out_dir / "exported_shaders.json", filtered_shaders)
+                write_json(json_dir / "exported_shaders.json", filtered_shaders)
                 print(f"    Shaders: {len(filtered_shaders)}/{len(shader_disasm)} pairs for significant draws")
 
                 print(f"\n[Step 6.5b] Collecting texture IDs for {len(significant_eids)} significant draws ...")
@@ -369,7 +374,7 @@ def main() -> None:
 
                 print(f"\n[Step 6.5c] Exporting textures ...")
                 textures = collect_textures(summary, out_dir, errors, resource_ids=tex_ids)
-                write_json(out_dir / "textures.json", textures)
+                write_json(json_dir / "textures.json", textures)
                 timings["texture_export"] = time.time() - t0
 
         # ═══════════════════════════════════════════════════════════════
@@ -380,9 +385,15 @@ def main() -> None:
         print("\n[Step 7] Running computed analysis ...")
         t0 = time.time()
         computed = compute_analysis(summary, pass_details, pipelines, resource_details)
-        write_json(out_dir / "computed.json", computed)
+        write_json(json_dir / "computed.json", computed)
         timings["computed"] = time.time() - t0
         print(f"  Done: computed analysis")
+
+        # ── Step 7.5: TSV export ──
+        print("\n[Step 7.5] Exporting TSV for LLM ...")
+        t0 = time.time()
+        export_tsv(tsv_dir, summary, pass_details, pipelines, bindings, resource_details, shader_disasm)
+        timings["tsv_export"] = time.time() - t0
 
         # ── Step 8: Render Graph HTML ──
         print("\n[Step 8] Generating Render Graph ...")
@@ -424,7 +435,7 @@ def main() -> None:
         "error_count": len(errors),
         "errors": errors.errors[:100],
     }
-    write_json(out_dir / "_collection.json", collection_meta)
+    write_json(json_dir / "_collection.json", collection_meta)
 
     # ── Summary ──
     print(f"\n{'='*60}")
@@ -435,15 +446,21 @@ def main() -> None:
         print(f"  Workers:    {num_workers}")
     print(f"  Errors:     {len(errors)}")
     print(f"  Files:")
-    for f in sorted(out_dir.iterdir()):
-        size = f.stat().st_size
-        if size > 1024 * 1024:
-            s = f"{size / 1024 / 1024:.1f} MB"
-        elif size > 1024:
-            s = f"{size / 1024:.1f} KB"
-        else:
-            s = f"{size} B"
-        print(f"    {f.name:30s} {s:>10s}")
+    def _print_tree(d: Path, prefix: str = "") -> None:
+        for f in sorted(d.iterdir()):
+            if f.is_dir():
+                print(f"    {prefix}{f.name}/")
+                _print_tree(f, prefix + "  ")
+            else:
+                size = f.stat().st_size
+                if size > 1024 * 1024:
+                    s = f"{size / 1024 / 1024:.1f} MB"
+                elif size > 1024:
+                    s = f"{size / 1024:.1f} KB"
+                else:
+                    s = f"{size} B"
+                print(f"    {prefix}{f.name:30s} {s:>10s}")
+    _print_tree(out_dir)
     print(f"{'='*60}")
 
 

@@ -50,8 +50,11 @@ def load_analysis(analysis_dir: Path) -> dict:
         "bindings": "bindings.json",
         "collection": "_collection.json",
     }
+    json_dir = analysis_dir / "json"
+    if not json_dir.is_dir():
+        json_dir = analysis_dir
     for key, fname in files.items():
-        data[key] = _load_json(analysis_dir / fname)
+        data[key] = _load_json(json_dir / fname)
     data["analysis_dir"] = str(analysis_dir)
     data["shaders_dir"] = analysis_dir / "shaders"
     return data

@@ -53,9 +53,22 @@ rdc-portable\rdc.bat close
 
 ### Two-Phase Pipeline
 
-**Phase 1 — `collect.py`**: Opens an .rdc capture via rdc-cli's daemon (JSON-RPC over TCP), collects base data (info, stats, passes, draws, events, resources, counters), then per-draw pipeline/bindings, shader disassembly, and resource details. Supports parallel collection with `-j N` workers (each a separate rdc daemon session). Outputs JSON files + `render_graph.html` into a `*-analysis/` directory.
+**Phase 1 — `collect.py`**: Opens an .rdc capture via rdc-cli's daemon (JSON-RPC over TCP), collects base data (info, stats, passes, draws, events, resources, counters), then per-draw pipeline/bindings, shader disassembly, and resource details. Supports parallel collection with `-j N` workers (each a separate rdc daemon session). Outputs into a `*-analysis/` directory:
 
-**Phase 2 — `analyze.py`**: Reads the `*-analysis/` JSON files and generates `performance_report.html` with sections: Frame Overview, Rendering Pipeline (Gantt + table), Triangle Hotspots, Bandwidth Estimation, Shader Complexity, Memory, and Optimization Suggestions.
+```
+{capture}-analysis/
+  json/             # Full JSON data (for scripts)
+  tsv/              # TSV tables (for AI/LLM analysis — token-efficient)
+    passes.tsv      # Pass overview: name, eid range, draw/dispatch counts, RT formats
+    draws.tsv       # Per-draw: eid, type, triangles, pass, topology, pipeline IDs
+    bindings.tsv    # Per-binding: eid, stage, kind, set, slot, resource name
+    resources.tsv   # All resources: textures + buffers unified
+    shaders.tsv     # Shader pairs: vs/ps/cs IDs, usage count, eid list
+  shaders/          # .shader disassembly files
+  render_graph.html
+```
+
+**Phase 2 — `analyze.py`**: Reads the `*-analysis/json/` files and generates `performance_report.html` with sections: Frame Overview, Rendering Pipeline (Gantt + table), Triangle Hotspots, Bandwidth Estimation, Shader Complexity, Memory, and Optimization Suggestions.
 
 ### Key Patterns
 
@@ -70,3 +83,4 @@ rdc-portable\rdc.bat close
 - **Embedded Python is the runtime**: Always use `python\python.exe`, not system Python. The embedded interpreter has all dependencies (click, numpy, protobuf, etc.) pre-installed in `python\Lib\site-packages\`.
 - **`python/` and `rdc-portable/` are read-only**: These directories contain checked-in binaries and installed packages. Edit only files under `Scripts/rdc/`.
 - **.rdc files are gitignored**: Capture files are large binaries excluded via `.gitignore`.
+- **AI 分析帧数据时必须从 `tsv/` 目录读取**：TSV 格式专为 LLM 设计，省 token、易解析。禁止直接读 `json/` 目录的 JSON 文件做分析——JSON 仅供脚本内部使用。
