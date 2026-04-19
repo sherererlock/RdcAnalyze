@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+Work style: telegraph; noun-phrases ok; drop grammar; min tokens.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
