@@ -27,6 +27,7 @@ from shared import (
     guess_bpp, unwrap, fmt_number, fmt_mb, rt_bytes,
     classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad,
     detect_shader_patterns,
+    analyze_spirv_instructions, estimate_register_pressure, deduplicate_shaders,
     STAGE_COLORS,
 )
 
@@ -322,6 +323,7 @@ def analyze_shaders(data: dict) -> dict:
         buffer_accesses = 0
 
         shader_path = shaders_dir / os.path.basename(fname) if fname else None
+        content = ""
         if shader_path and shader_path.exists():
             try:
                 content = shader_path.read_text(encoding="utf-8", errors="replace")
@@ -354,6 +356,16 @@ def analyze_shaders(data: dict) -> dict:
             except Exception:
                 pass
 
+        instructions = analyze_spirv_instructions(content, is_compute) if content else {
+            "arithmetic": 0, "sample": 0, "logic": 0, "load_store": 0,
+            "dot_matrix": 0, "intrinsic": 0, "barrier": 0, "total": 0,
+        }
+        reg_pressure = estimate_register_pressure(content, is_compute) if content else {
+            "temp_vars": 0, "input_vars": 0, "output_vars": 0,
+            "uniform_vars": 0, "spirv_bound": 0,
+            "estimated_vgprs": 0, "pressure_level": "low",
+        }
+
         entry = {
             "key": key,
             "is_compute": is_compute,
@@ -363,6 +375,8 @@ def analyze_shaders(data: dict) -> dict:
             "tex_samples": tex_samples,
             "ubo_size": ubo_size,
             "ps_lines": ps_lines,
+            "instructions": instructions,
+            "register_pressure": reg_pressure,
         }
         if is_compute:
             entry["cs_id"] = cs_id
@@ -374,10 +388,51 @@ def analyze_shaders(data: dict) -> dict:
 
     shader_list.sort(key=lambda s: s["uses"] * max(s["spirv_bound"], 1), reverse=True)
 
+    # Shader variant deduplication
+    variants = deduplicate_shaders(shader_disasm, shaders_dir)
+    variant_count_by_key: dict[str, int] = {}
+    for g in variants["groups"]:
+        for vk in g["variant_keys"]:
+            variant_count_by_key[vk] = g["variant_count"]
+    for s in shader_list:
+        s["variant_count"] = variant_count_by_key.get(s["key"], 1)
+
+    # Shader → Pass matrix
+    pass_details = data.get("pass_details") or []
+    pass_names = [p.get("name", f"Pass {i}") for i, p in enumerate(pass_details)]
+    pass_ranges = [(p.get("begin_eid", 0), p.get("end_eid", 0)) for p in pass_details]
+
+    matrix: list[list[int]] = []
+    multi_pass_indices: list[int] = []
+    for si, s in enumerate(shader_list):
+        row = [0] * len(pass_details)
+        for eid in s.get("eids", []):
+            for pi, (beg, end) in enumerate(pass_ranges):
+                if beg <= eid <= end:
+                    row[pi] += 1
+                    break
+        matrix.append(row)
+        if sum(1 for c in row if c > 0) >= 2:
+            multi_pass_indices.append(si)
+
+    shader_pass_matrix = {
+        "shaders": [
+            {"key": s["key"],
+             "label": f'CS {s.get("cs_id", 0)}' if s.get("is_compute")
+             else f'VS {s.get("vs_id", 0)} / PS {s.get("ps_id", 0)}'}
+            for s in shader_list
+        ],
+        "passes": pass_names,
+        "matrix": matrix,
+        "multi_pass_indices": multi_pass_indices,
+    }
+
     return {
         "shaders": shader_list,
         "total_unique": len(shader_list),
         "total_compute": sum(1 for s in shader_list if s.get("is_compute")),
+        "variants": variants,
+        "shader_pass_matrix": shader_pass_matrix,
     }
 
 
@@ -1146,6 +1201,18 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
             shader_label = f'CS {s["cs_id"]}'
         else:
             shader_label = f'VS {s.get("vs_id", 0)} / PS {s.get("ps_id", 0)}'
+        # Pressure tag
+        rp = s.get("register_pressure", {})
+        plevel = rp.get("pressure_level", "low")
+        pressure_colors = {"low": "#22c55e", "medium": "#eab308", "high": "#ef4444"}
+        pc = pressure_colors.get(plevel, "#888")
+        pressure_tag = (
+            f'<span class="stage-tag" style="background:{pc}20;color:{pc};'
+            f'border:1px solid {pc}40">{plevel}</span>'
+        )
+        # Variant count
+        vc = s.get("variant_count", 1)
+        variant_cell = f'{vc}' if vc > 1 else '-'
         shader_rows.append(
             f'<tr>'
             f'<td class="mono">{shader_label}</td>'
@@ -1155,6 +1222,8 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
             f'<td class="num">{s["tex_samples"]}</td>'
             f'<td class="num">{_fmt_number(s["ps_lines"])}</td>'
             f'<td class="num">{s["ubo_size"] if s["ubo_size"] > 0 else "-"}</td>'
+            f'<td>{pressure_tag}</td>'
+            f'<td class="num">{variant_cell}</td>'
             f'</tr>'
         )
 
@@ -1162,17 +1231,143 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     if shaders.get("total_compute", 0) > 0:
         cs_note = f' ({shaders["total_compute"]} compute)'
 
+    # 5a: Instruction mix stacked bars
+    INSTR_COLORS = {
+        "arithmetic": "#3b82f6", "sample": "#22c55e", "logic": "#f59e0b",
+        "load_store": "#8b5cf6", "dot_matrix": "#ec4899",
+        "intrinsic": "#06b6d4", "barrier": "#ef4444",
+    }
+    instr_bars = []
+    for s in top_shaders[:15]:
+        inst = s.get("instructions", {})
+        total = inst.get("total", 0) or 1
+        if s.get("is_compute"):
+            label = f'CS {s.get("cs_id", 0)}'
+        else:
+            label = f'VS {s.get("vs_id", 0)} / PS {s.get("ps_id", 0)}'
+        segments = []
+        for cat in ("arithmetic", "sample", "logic", "load_store", "dot_matrix", "intrinsic", "barrier"):
+            v = inst.get(cat, 0)
+            if v > 0:
+                pct = v / total * 100
+                segments.append(
+                    f'<div class="stack-seg" style="width:{pct:.1f}%;background:{INSTR_COLORS[cat]}"'
+                    f' title="{cat}: {v}"></div>'
+                )
+        instr_bars.append(
+            f'<div class="bar-row">'
+            f'<div class="bar-label mono" style="min-width:160px">{label}</div>'
+            f'<div class="bar-track" style="display:flex">{"".join(segments)}</div>'
+            f'<div class="bar-value">{total}</div>'
+            f'</div>'
+        )
+    instr_legend = " ".join(
+        f'<span style="display:inline-flex;align-items:center;gap:3px;margin-right:10px">'
+        f'<span style="width:10px;height:10px;border-radius:2px;background:{c};display:inline-block"></span>'
+        f'{n}</span>'
+        for n, c in INSTR_COLORS.items()
+    )
+
+    # 5b: Shader variants
+    variants = shaders.get("variants", {})
+    variant_groups = [g for g in variants.get("groups", []) if g["variant_count"] > 1]
+    variant_rows = []
+    for g in variant_groups:
+        spec_desc = ", ".join(f'SpecId({sid})' for sid in g.get("spec_diffs", {}))
+        variant_rows.append(
+            f'<tr>'
+            f'<td class="mono">{_esc(g["canonical_key"])}</td>'
+            f'<td class="num">{g["variant_count"]}</td>'
+            f'<td class="num">{g["total_uses"]}</td>'
+            f'<td>{_esc(spec_desc) if spec_desc else "-"}</td>'
+            f'</tr>'
+        )
+    variants_html = ""
+    if variant_groups:
+        variants_html = f"""
+        <h4>Shader Variants</h4>
+        <div class="mini-cards">
+          <div class="mini-card">
+            <div class="mini-label">Total Shaders</div>
+            <div class="mini-value">{variants.get("total_shaders", 0)}</div>
+          </div>
+          <div class="mini-card">
+            <div class="mini-label">Unique (after dedup)</div>
+            <div class="mini-value">{variants.get("unique_shaders", 0)}</div>
+          </div>
+          <div class="mini-card">
+            <div class="mini-label">Variant Groups</div>
+            <div class="mini-value">{variants.get("variant_groups", 0)}</div>
+          </div>
+        </div>
+        <div class="table-wrap">
+        <table class="data-table compact">
+          <thead><tr><th>Canonical Shader</th><th>Variants</th><th>Total Uses</th><th>SpecId Diffs</th></tr></thead>
+          <tbody>{"".join(variant_rows)}</tbody>
+        </table>
+        </div>
+        """
+
+    # 5c: Shader × Pass heatmap
+    spm = shaders.get("shader_pass_matrix", {})
+    heatmap_html = ""
+    multi_idx = spm.get("multi_pass_indices", [])
+    if multi_idx and spm.get("passes"):
+        spm_shaders = spm["shaders"]
+        spm_passes = spm["passes"]
+        spm_matrix = spm["matrix"]
+        max_count = max(
+            (spm_matrix[si][pi] for si in multi_idx for pi in range(len(spm_passes))),
+            default=1,
+        ) or 1
+        # Truncate pass names for column headers
+        pass_headers = []
+        for pn in spm_passes:
+            short = pn[:18] + ".." if len(pn) > 20 else pn
+            pass_headers.append(f'<th class="hm-th" title="{_esc(pn)}">{_esc(short)}</th>')
+        hm_rows = []
+        for si in multi_idx:
+            cells = []
+            for pi in range(len(spm_passes)):
+                v = spm_matrix[si][pi]
+                if v == 0:
+                    cells.append('<td class="hm-cell"></td>')
+                else:
+                    opacity = max(0.15, v / max_count)
+                    cells.append(
+                        f'<td class="hm-cell" style="background:rgba(56,189,248,{opacity:.2f})"'
+                        f' title="{v} draws">{v}</td>'
+                    )
+            hm_rows.append(
+                f'<tr><td class="mono hm-label">{_esc(spm_shaders[si]["label"])}</td>'
+                f'{"".join(cells)}</tr>'
+            )
+        heatmap_html = f"""
+        <h4>Shader Usage Heatmap</h4>
+        <div class="table-wrap">
+        <table class="data-table compact heatmap-table">
+          <thead><tr><th>Shader</th>{"".join(pass_headers)}</tr></thead>
+          <tbody>{"".join(hm_rows)}</tbody>
+        </table>
+        </div>
+        """
+
     shaders_html = f"""
     <div class="card-inline">Total unique shaders: <strong>{shaders['total_unique']}</strong>{cs_note}</div>
     <div class="table-wrap">
     <table class="data-table sortable">
       <thead><tr>
         <th>Shader</th><th>Uses</th><th>SPIR-V Bound</th>
-        <th>Tex Samples</th><th>Lines</th><th>UBO Size</th>
+        <th>Tex Samples</th><th>Lines</th><th>UBO Size</th><th>Pressure</th><th>Variants</th>
       </tr></thead>
       <tbody>{"".join(shader_rows)}</tbody>
     </table>
     </div>
+    <h4>Instruction Mix</h4>
+    <div style="margin-bottom:8px;font-size:12px">{instr_legend}</div>
+    <div class="bar-chart">{"".join(instr_bars)}</div>
+    {variants_html}
+    {heatmap_html}
     """
 
     # Section 6: Memory
@@ -1581,6 +1776,18 @@ body::before {{
   color: var(--text-muted);
   text-transform: uppercase;
 }}
+
+/* ── Instruction stacked bar segments ── */
+.stack-seg {{
+  height: 18px;
+  min-width: 2px;
+}}
+
+/* ── Heatmap table ── */
+.heatmap-table th, .heatmap-table td {{ text-align: center; padding: 4px 6px; }}
+.hm-th {{ font-size: 10px; writing-mode: vertical-lr; transform: rotate(180deg); max-width: 30px; height: 100px; }}
+.hm-label {{ text-align: left !important; white-space: nowrap; font-size: 11px; }}
+.hm-cell {{ font-size: 11px; min-width: 28px; color: var(--text-primary); }}
 
 /* ── Bar charts ── */
 .bar-chart {{

@@ -662,6 +662,186 @@ def detect_shader_patterns(shader_content: str) -> list[str]:
     return detected
 
 
+def analyze_spirv_instructions(shader_content: str, is_compute: bool = False) -> dict:
+    """Count instruction categories from RenderDoc SPIR-V disassembly."""
+    if is_compute:
+        text = shader_content
+    else:
+        parts = shader_content.split("Pixel Shader")
+        text = parts[1] if len(parts) >= 2 else ""
+
+    if not text:
+        return {"arithmetic": 0, "sample": 0, "logic": 0, "load_store": 0,
+                "dot_matrix": 0, "intrinsic": 0, "barrier": 0, "total": 0}
+
+    lines = text.split("\n")
+    arith = 0
+    sample = 0
+    logic = 0
+    load_store = 0
+    dot_matrix = 0
+    intrinsic = 0
+    barrier = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("struct "):
+            continue
+
+        if "ImageSampleImplicitLod" in stripped or "ImageSampleExplicitLod" in stripped:
+            sample += 1
+        elif "ImageSampleDrefImplicitLod" in stripped:
+            sample += 1
+        elif "ImageFetch" in stripped:
+            sample += 1
+
+        if "Dot(" in stripped:
+            dot_matrix += 1
+        elif "MatrixTimesVector" in stripped or "MatrixTimesMatrix" in stripped:
+            dot_matrix += 1
+        elif "VectorTimesMatrix" in stripped:
+            dot_matrix += 1
+
+        if "GLSL.std.450::" in stripped:
+            intrinsic += stripped.count("GLSL.std.450::")
+
+        if "ControlBarrier" in stripped or "MemoryBarrier" in stripped:
+            barrier += 1
+
+        if stripped.startswith("if (") or stripped.startswith("} else"):
+            logic += 1
+        elif stripped.startswith("switch (") or stripped.startswith("for (") or stripped.startswith("while ("):
+            logic += 1
+
+        if "= *" in stripped:
+            load_store += 1
+        if re.match(r"^\*_\d+", stripped):
+            load_store += 1
+
+        for op in (" + ", " - ", " * ", " / "):
+            if op in stripped:
+                arith += stripped.count(op)
+                break
+
+    total = arith + sample + logic + load_store + dot_matrix + intrinsic + barrier
+    return {
+        "arithmetic": arith, "sample": sample, "logic": logic,
+        "load_store": load_store, "dot_matrix": dot_matrix,
+        "intrinsic": intrinsic, "barrier": barrier, "total": total,
+    }
+
+
+def estimate_register_pressure(shader_content: str, is_compute: bool = False) -> dict:
+    """Estimate register pressure from RenderDoc SPIR-V disassembly."""
+    if is_compute:
+        text = shader_content
+    else:
+        parts = shader_content.split("Pixel Shader")
+        text = parts[1] if len(parts) >= 2 else ""
+
+    if not text:
+        return {"temp_vars": 0, "input_vars": 0, "output_vars": 0,
+                "uniform_vars": 0, "spirv_bound": 0,
+                "estimated_vgprs": 0, "pressure_level": "low"}
+
+    temp_vars = len(re.findall(r"^Private\s+\S+\*", text, re.MULTILINE))
+    input_vars = len(re.findall(r"^Input\s+\S+\*", text, re.MULTILINE))
+    output_vars = len(re.findall(r"^Output\s+\S+\*", text, re.MULTILINE))
+    uniform_vars = len(re.findall(r"^(?:Uniform|UniformConstant)\s+\S+\*", text, re.MULTILINE))
+
+    bound_match = re.search(r"<id> bound of (\d+)", text)
+    spirv_bound = int(bound_match.group(1)) if bound_match else 0
+
+    estimated_vgprs = temp_vars * 4
+    if estimated_vgprs > 64:
+        pressure_level = "high"
+    elif estimated_vgprs > 32:
+        pressure_level = "medium"
+    else:
+        pressure_level = "low"
+
+    return {
+        "temp_vars": temp_vars, "input_vars": input_vars,
+        "output_vars": output_vars, "uniform_vars": uniform_vars,
+        "spirv_bound": spirv_bound, "estimated_vgprs": estimated_vgprs,
+        "pressure_level": pressure_level,
+    }
+
+
+def deduplicate_shaders(shader_disasm: dict, shaders_dir: Path) -> dict:
+    """Group shader variants that differ only by specialization constants."""
+    import hashlib
+
+    _SPEC_VALUE_RE = re.compile(
+        r"(const\s+\w+\s+_\d+\s*=\s*)([^:]+?)(\s*:\s*\[\[SpecId\(\d+\)\]\])"
+    )
+    _HEADER_RE = re.compile(r"^//.*$", re.MULTILINE)
+
+    shader_hashes: dict[str, list[str]] = {}
+    shader_specs: dict[str, dict[int, str]] = {}
+
+    for key, info in shader_disasm.items():
+        if not isinstance(info, dict):
+            continue
+        fname = info.get("file", "")
+        if not fname:
+            continue
+        shader_path = shaders_dir / Path(fname).name
+        if not shader_path.exists():
+            continue
+        try:
+            content = shader_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        stripped = _HEADER_RE.sub("", content).strip()
+        normalized = _SPEC_VALUE_RE.sub(r"\1<SPEC>\3", stripped)
+        h = hashlib.md5(normalized.encode("utf-8")).hexdigest()
+
+        shader_hashes.setdefault(h, []).append(key)
+
+        specs: dict[int, str] = {}
+        for m in _SPEC_VALUE_RE.finditer(content):
+            sid_match = re.search(r"SpecId\((\d+)\)", m.group(3))
+            if sid_match:
+                specs[int(sid_match.group(1))] = m.group(2).strip()
+        shader_specs[key] = specs
+
+    groups = []
+    variant_group_count = 0
+    for h, keys in sorted(shader_hashes.items(), key=lambda kv: -len(kv[1])):
+        canonical = keys[0]
+        total_uses = sum(
+            (shader_disasm.get(k) or {}).get("uses", 0) for k in keys
+        )
+        spec_diffs: dict[int, list[str]] = {}
+        all_spec_ids: set[int] = set()
+        for k in keys:
+            all_spec_ids.update(shader_specs.get(k, {}).keys())
+        for sid in sorted(all_spec_ids):
+            vals = [shader_specs.get(k, {}).get(sid, "") for k in keys]
+            if len(set(vals)) > 1:
+                spec_diffs[sid] = vals
+
+        if len(keys) > 1:
+            variant_group_count += 1
+
+        groups.append({
+            "canonical_key": canonical,
+            "variant_keys": keys,
+            "variant_count": len(keys),
+            "spec_diffs": spec_diffs,
+            "total_uses": total_uses,
+        })
+
+    return {
+        "groups": groups,
+        "total_shaders": len(shader_disasm),
+        "unique_shaders": len(groups),
+        "variant_groups": variant_group_count,
+    }
+
+
 def _renumber_deduped(passes: list[dict]) -> None:
     """Renumber passes per-type after dedup removed old-frame passes."""
     counters: dict[str, int] = {}

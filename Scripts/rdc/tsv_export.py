@@ -7,7 +7,10 @@ import json
 from pathlib import Path
 
 from rpc import _unwrap
-from shared import classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad
+from shared import (
+    classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad,
+    analyze_spirv_instructions, estimate_register_pressure, deduplicate_shaders,
+)
 
 
 def write_tsv(path: Path, headers: list[str], rows: list[list]) -> None:
@@ -400,6 +403,82 @@ def _build_counters_by_eid(summary: dict) -> dict[int, dict]:
     return result
 
 
+def _build_shader_instructions(
+    shader_disasm: dict, shaders_dir: Path,
+) -> tuple[list[str], list[list]]:
+    headers = [
+        "key", "arithmetic", "sample", "logic", "load_store",
+        "dot_matrix", "intrinsic", "barrier", "total",
+        "pressure_level", "estimated_vgprs",
+    ]
+    rows = []
+    for key, info in sorted(shader_disasm.items(), key=lambda kv: -kv[1].get("uses", 0)):
+        if not isinstance(info, dict):
+            continue
+        fname = info.get("file", "")
+        if not fname:
+            continue
+        shader_path = shaders_dir / Path(fname).name
+        if not shader_path.exists():
+            continue
+        try:
+            content = shader_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        is_compute = "cs_id" in info
+        inst = analyze_spirv_instructions(content, is_compute)
+        rp = estimate_register_pressure(content, is_compute)
+        rows.append([
+            key,
+            inst["arithmetic"], inst["sample"], inst["logic"], inst["load_store"],
+            inst["dot_matrix"], inst["intrinsic"], inst["barrier"], inst["total"],
+            rp["pressure_level"], rp["estimated_vgprs"],
+        ])
+    return headers, rows
+
+
+def _build_shader_variants(
+    shader_disasm: dict, shaders_dir: Path,
+) -> tuple[list[str], list[list]]:
+    variants = deduplicate_shaders(shader_disasm, shaders_dir)
+    headers = ["group_key", "variant_key", "spec_ids", "uses"]
+    rows = []
+    for g in variants.get("groups", []):
+        for vk in g["variant_keys"]:
+            spec_str = ",".join(
+                f'{sid}={vals[g["variant_keys"].index(vk)]}'
+                for sid, vals in g.get("spec_diffs", {}).items()
+                if g["variant_keys"].index(vk) < len(vals)
+            )
+            uses = (shader_disasm.get(vk) or {}).get("uses", 0)
+            rows.append([g["canonical_key"], vk, spec_str, uses])
+    return headers, rows
+
+
+def _build_shader_pass_matrix(
+    shader_disasm: dict, pass_details: list[dict],
+) -> tuple[list[str], list[list]]:
+    if not pass_details or not shader_disasm:
+        return [], []
+    pass_names = [p.get("name", f"Pass {i}") for i, p in enumerate(pass_details)]
+    pass_ranges = [(p.get("begin_eid", 0), p.get("end_eid", 0)) for p in pass_details]
+
+    headers = ["shader_key"] + pass_names
+    rows = []
+    for key in sorted(shader_disasm, key=lambda k: -(shader_disasm[k] or {}).get("uses", 0)):
+        info = shader_disasm.get(key)
+        if not isinstance(info, dict):
+            continue
+        row = [0] * len(pass_details)
+        for eid in info.get("eids", []):
+            for pi, (beg, end) in enumerate(pass_ranges):
+                if beg <= eid <= end:
+                    row[pi] += 1
+                    break
+        rows.append([key] + row)
+    return headers, rows
+
+
 def export_tsv(
     tsv_dir: Path,
     summary: dict,
@@ -409,6 +488,7 @@ def export_tsv(
     resource_details: dict,
     shader_disasm: dict,
     computed: dict | None = None,
+    shaders_dir: Path | None = None,
 ) -> None:
     tsv_dir.mkdir(parents=True, exist_ok=True)
     tables = {
@@ -435,6 +515,19 @@ def export_tsv(
     dth, dtr = _build_draw_timing(summary, pass_details, counters_by_eid)
     if dth:
         tables["draw_timing"] = (dth, dtr)
+
+    # Shader analysis tables (require shaders_dir)
+    if shaders_dir and shaders_dir.exists():
+        sih, sir = _build_shader_instructions(shader_disasm, shaders_dir)
+        if sih:
+            tables["shader_instructions"] = (sih, sir)
+        svh, svr = _build_shader_variants(shader_disasm, shaders_dir)
+        if svh:
+            tables["shader_variants"] = (svh, svr)
+
+    spmh, spmr = _build_shader_pass_matrix(shader_disasm, pass_details)
+    if spmh:
+        tables["shader_pass_matrix"] = (spmh, spmr)
 
     written = 0
     for name, (headers, rows) in tables.items():
