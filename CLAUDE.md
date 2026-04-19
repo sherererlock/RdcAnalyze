@@ -15,7 +15,7 @@ Scripts/rdc/          # Main analysis scripts (the code you'll edit most)
   collect.py          # Phase 1: automated data collection from .rdc captures via rdc-cli
   analyze.py          # Phase 2: generates interactive HTML performance report from collected JSON
   tsv_export.py       # TSV table generation (called by collect.py)
-  shared.py           # Shared utilities (BPP tables, format helpers, stage classification)
+  shared.py           # Shared utilities (BPP tables, format helpers, stage classification, shader pattern detection)
 Scripts/rdc-report.bat  # One-command pipeline: collect → analyze
 
 rdc-portable/         # Portable RenderDoc (binaries + Python bindings, checked in)
@@ -64,7 +64,10 @@ rdc-portable\rdc.bat close
     draws.tsv       # Per-draw: eid, type, triangles, pass, topology, pipeline IDs
     bindings.tsv    # Per-binding: eid, stage, kind, set, slot, resource name
     resources.tsv   # All resources: textures + buffers unified
-    shaders.tsv     # Shader pairs: vs/ps/cs IDs, usage count, eid list
+    shaders.tsv          # Shader pairs: vs/ps/cs IDs, usage count, eid list
+    shader_instructions.tsv  # Per-shader instruction mix (arithmetic/sample/logic/...) + register pressure
+    shader_variants.tsv  # Shader variant deduplication groups (SpecId diff)
+    shader_pass_matrix.tsv   # Shader × Pass usage matrix (draw counts)
     pipeline_stages.tsv  # Auto-classified stage per pass (Compute/ShadowMap/MainColor/Bloom/UI/...)
     stage_summary.tsv    # GPU time distribution by stage type
   shaders/          # .shader disassembly files
@@ -79,6 +82,8 @@ rdc-portable\rdc.bat close
 - **WorkerPool**: Manages parallel daemon sessions (`rdc-collect-w0..wN`) for concurrent per-draw and resource data collection.
 - **Render Graph**: `_extract_subpasses()` builds fine-grained sub-pass nodes from event marker hierarchy, then `_build_dependency_edges()` infers RT data flow using multiple strategies (explicit deps → per-pass reads/writes → RT usage events → descriptors → name similarity → unconsumed RT propagation).
 - **Pipeline Stage Classification** (`shared.py`): Two-tier heuristic — (1) engine-provided pass name keywords (shadow, gbuffer, bloom, fxaa…), (2) metadata fallback for RenderDoc auto-generated names (RT format/size, load ops, draw characteristics). Includes `detect_bloom_chain()` (progressive ½ resolution downsample-upsample detection) and `detect_fullscreen_quad()` (tri≤2 + PS invocations ≈ RT pixels).
+- **Shader Pattern Detection** (`shared.py`): Registry-based pattern recognition on RenderDoc SPIR-V disassembly. `ShaderContext` dataclass pre-parses shared signals (sample counts, Dref, Cube sampler, Log2/Exp2, Dot count, etc.); individual `@_register`-decorated detectors match against context. Supports both PS and CS. Current patterns: Fullscreen Blit, Dithering, FXAA, Bloom Threshold, Gaussian Blur, Tonemapping, Shadow Map, PBR IBL. TODO stubs: SSAO, SSR, Bilateral Filter.
+- **Shader Analysis** (`shared.py` + `analyze.py`): Per-shader instruction distribution (`analyze_spirv_instructions`), register pressure estimation (`estimate_register_pressure`), variant deduplication via normalized content hash (`deduplicate_shaders`), shader→pass usage heatmap matrix.
 - **HTML reports** reference shared CSS from an `assets/` directory via relative path (`__ASSETS__` placeholder replaced at generation time).
 
 ## Important Constraints

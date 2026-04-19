@@ -72,7 +72,7 @@ flowchart TD
     subgraph POST_MERGE ["后处理阶段"]
         direction TB
         S7["Step 7: 计算分析<br/>compute_analysis()"]
-        S75["Step 7.5: TSV 导出<br/>export_tsv()<br/>(含 pipeline_stages 分类)"]
+        S75["Step 7.5: TSV 导出<br/>export_tsv()<br/>(含 pipeline_stages/shader 分析)"]
         S8["Step 8: 生成 Render Graph HTML<br/>generate_render_graph_html()"]
         S9["Step 9: 关闭主会话<br/>rdc close"]
         S7 --> S75 --> S8 --> S9
@@ -97,7 +97,7 @@ flowchart TD
         A2b["analyze_pipeline_stages()<br/>阶段分类/GPU时间/Bloom检测"]
         A3["analyze_hotspots()<br/>Top DrawCall/重复 Mesh"]
         A4["analyze_bandwidth()<br/>带宽估算/Bloom 统计"]
-        A5["analyze_shaders()<br/>SPIR-V 复杂度分析"]
+        A5["analyze_shaders()<br/>SPIR-V 复杂度/指令分布/<br/>寄存器压力/变体去重/热力图"]
         A6["analyze_memory()<br/>纹理内存/格式分布"]
     end
 
@@ -111,7 +111,7 @@ flowchart TD
         H2b["03 Pipeline Stage Analysis — 阶段分布 + Bloom链 + 分类表"]
         H3["04 Hotspots — 条形图 + 重复 Mesh 表"]
         H4["05 Bandwidth — 带宽条形图"]
-        H5["06 Shader Complexity — Shader 表格"]
+        H5["06 Shader Complexity — Shader 表格<br/>+ Instruction Mix + Variants + Heatmap"]
         H6["07 Memory — 资源大小 + 格式分布"]
         H7["08 Suggestions — 优化建议卡片"]
         H1 --> H2 --> H2b --> H3 --> H4 --> H5 --> H6 --> H7
