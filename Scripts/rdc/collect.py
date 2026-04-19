@@ -392,7 +392,7 @@ def main() -> None:
         # ── Step 7.5: TSV export ──
         print("\n[Step 7.5] Exporting TSV for LLM ...")
         t0 = time.time()
-        export_tsv(tsv_dir, summary, pass_details, pipelines, bindings, resource_details, shader_disasm)
+        export_tsv(tsv_dir, summary, pass_details, pipelines, bindings, resource_details, shader_disasm, computed)
         timings["tsv_export"] = time.time() - t0
 
         # ── Step 8: Render Graph HTML ──

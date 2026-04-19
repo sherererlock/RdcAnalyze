@@ -126,6 +126,107 @@ def _build_resources(resource_details: dict) -> tuple[list[str], list[list]]:
     return headers, rows
 
 
+def _build_frame_info(summary: dict) -> tuple[list[str], list[list]]:
+    info = summary.get("info") or {}
+    headers = ["key", "value"]
+    rows = [[k, v] for k, v in info.items()]
+    return headers, rows
+
+
+def _build_counters(summary: dict) -> tuple[list[str], list[list]]:
+    counters = summary.get("counters") or {}
+    raw_rows = counters.get("rows") or (counters if isinstance(counters, list) else [])
+    if not raw_rows:
+        return [], []
+    headers = ["eid", "counter", "value", "unit"]
+    rows = []
+    for r in raw_rows:
+        if not isinstance(r, dict):
+            continue
+        rows.append([
+            r.get("eid", ""),
+            r.get("counter", ""),
+            r.get("value", ""),
+            r.get("unit", ""),
+        ])
+    return headers, rows
+
+
+def _build_events(summary: dict) -> tuple[list[str], list[list]]:
+    events = _unwrap(summary.get("events"), "events") or []
+    if not events:
+        return [], []
+    headers = ["eid", "type", "name"]
+    rows = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        rows.append([e.get("eid", ""), e.get("type", ""), e.get("name", "")])
+    return headers, rows
+
+
+def _build_deps(summary: dict) -> tuple[list[str], list[list]]:
+    pass_deps = summary.get("pass_deps") or {}
+    edges = pass_deps.get("edges") or []
+    if not edges:
+        return [], []
+    headers = ["src", "dst", "resources"]
+    rows = []
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        rids = e.get("resources") or []
+        rows.append([
+            e.get("src", ""),
+            e.get("dst", ""),
+            ",".join(str(r) for r in rids),
+        ])
+    return headers, rows
+
+
+def _build_pass_rw(summary: dict) -> tuple[list[str], list[list]]:
+    pass_deps = summary.get("pass_deps") or {}
+    per_pass = pass_deps.get("per_pass") or []
+    if not per_pass:
+        return [], []
+    headers = ["pass", "reads", "writes"]
+    rows = []
+    for pp in per_pass:
+        if not isinstance(pp, dict):
+            continue
+        rows.append([
+            pp.get("name", ""),
+            ",".join(str(r) for r in (pp.get("reads") or [])),
+            ",".join(str(r) for r in (pp.get("writes") or [])),
+        ])
+    return headers, rows
+
+
+def _build_alerts(computed: dict) -> tuple[list[str], list[list]]:
+    alerts = computed.get("alerts") or []
+    if not alerts:
+        return [], []
+    headers = ["severity", "type", "eid", "id", "name", "detail"]
+    rows = []
+    for a in alerts:
+        if not isinstance(a, dict):
+            continue
+        detail = ""
+        if "triangles" in a:
+            detail = f"triangles={a['triangles']}"
+        elif "size_mb" in a:
+            detail = f"size_mb={a['size_mb']}"
+        rows.append([
+            a.get("severity", ""),
+            a.get("type", ""),
+            a.get("eid", ""),
+            a.get("id", ""),
+            a.get("name", a.get("pass", "")),
+            detail,
+        ])
+    return headers, rows
+
+
 def _build_shaders(shader_disasm: dict) -> tuple[list[str], list[list]]:
     headers = ["key", "vs_id", "ps_id", "cs_id", "uses", "eids", "file"]
     rows = []
@@ -153,15 +254,25 @@ def export_tsv(
     bindings: dict,
     resource_details: dict,
     shader_disasm: dict,
+    computed: dict | None = None,
 ) -> None:
     tsv_dir.mkdir(parents=True, exist_ok=True)
     tables = {
+        "frame_info": _build_frame_info(summary),
         "passes": _build_passes(pass_details),
         "draws": _build_draws(summary, pipelines),
         "bindings": _build_bindings(bindings),
         "resources": _build_resources(resource_details),
         "shaders": _build_shaders(shader_disasm),
+        "counters": _build_counters(summary),
+        "events": _build_events(summary),
+        "deps": _build_deps(summary),
+        "pass_rw": _build_pass_rw(summary),
+        "alerts": _build_alerts(computed or {}),
     }
+    written = 0
     for name, (headers, rows) in tables.items():
-        write_tsv(tsv_dir / f"{name}.tsv", headers, rows)
-    print(f"  TSV: {len(tables)} files ({', '.join(tables)})")
+        if headers:
+            write_tsv(tsv_dir / f"{name}.tsv", headers, rows)
+            written += 1
+    print(f"  TSV: {written} files")
