@@ -434,16 +434,18 @@ def _build_dependency_edges(
         dep_edges = pass_deps.get("edges") or []
         per_pass = pass_deps.get("per_pass") or []
 
+    seq_count = len(edges)
+
     if dep_edges:
         _add_edges_from_dep_edges(subpasses, coarse_passes, dep_edges, edges, edge_set)
-    elif per_pass:
+    if len(edges) == seq_count and per_pass:
         _add_edges_from_per_pass(subpasses, coarse_passes, per_pass, edges, edge_set)
-    elif rt_usage:
+    if len(edges) == seq_count and rt_usage:
         _add_edges_from_rt_usage(subpasses, rt_usage, edges, edge_set)
         _add_edges_from_descriptors(subpasses, rt_usage, edges, edge_set)
         _add_edges_from_rt_name_similarity(subpasses, edges, edge_set)
         _add_edges_from_unconsumed_rts(subpasses, edges, edge_set)
-    else:
+    if len(edges) == seq_count:
         _add_edges_from_shared_rts(subpasses, edges, edge_set)
 
     return edges
