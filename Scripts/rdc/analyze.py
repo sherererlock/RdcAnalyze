@@ -28,7 +28,7 @@ from shared import (
     classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad,
     detect_shader_patterns,
     analyze_spirv_instructions, estimate_register_pressure, deduplicate_shaders,
-    STAGE_COLORS,
+    STAGE_COLORS, write_json,
 )
 
 
@@ -2166,6 +2166,11 @@ def main():
     assets_rel = os.path.relpath(html_assets_dir, analysis_dir).replace("\\", "/")
     print("Generating HTML report ...")
     html = render_html(analysis, capture_name, assets_rel=assets_rel)
+
+    analysis_json_path = analysis_dir / "json" / "analysis.json"
+    analysis_json_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(analysis_json_path, analysis)
+    print(f"[OK] Analysis JSON: {analysis_json_path}")
 
     out_path = analysis_dir / "performance_report.html"
     out_path.write_text(html, encoding="utf-8")

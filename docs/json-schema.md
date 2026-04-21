@@ -618,6 +618,29 @@
 
 ---
 
+## 13. analysis.json
+
+**来源**: `analyze.py:main()` 在生成 HTML 报告后写入；由 `analyze_frame_overview` / `analyze_pipeline` / `analyze_pipeline_stages` / `analyze_hotspots` / `analyze_bandwidth` / `analyze_shaders` / `analyze_memory` / `generate_suggestions` 八个函数的返回值组装。
+
+**作用**: 把 HTML 报告背后的派生指标（GPU 时间、Pass、Stage、Hotspot、带宽、Shader、内存、建议）一次性落盘，供下游工具复用：多 capture 对比 (`compare.py`)、CI 阈值断言 (`assert.py`)、外部 BI/dashboard。HTML 报告是给人看的，`analysis.json` 是给机器读的。
+
+```jsonc
+{
+  "overview":        { /* analyze_frame_overview: draw/dispatch/pass counts, triangles, ... */ },
+  "pipeline":        { /* analyze_pipeline:        每 pass 的 Gantt/timing 数据 */ },
+  "pipeline_stages": { /* analyze_pipeline_stages: stage 自动分类 + GPU 时间分布 */ },
+  "hotspots":        { /* analyze_hotspots:        top triangle/GPU-time draws */ },
+  "bandwidth":       { /* analyze_bandwidth:       RT load/store MB 估算 + bloom 链 */ },
+  "shaders":         { /* analyze_shaders:         指令分布、变体、模式识别统计 */ },
+  "memory":          { /* analyze_memory:          纹理/缓冲区内存占用 */ },
+  "suggestions":     [ /* generate_suggestions:    优化建议条目数组 */ ]
+}
+```
+
+> 八个 key 的内部结构由各 `analyze_*` 函数决定，参见 `Scripts/rdc/analyze.py` 对应函数定义。后续如新增分析维度（如 C2 overdraw、C5 TBDR），新 key 直接挂在顶层即可，不破坏既有消费者。
+
+---
+
 ## 数据流向关系
 
 ```
