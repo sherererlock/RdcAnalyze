@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter, defaultdict
 
 from rpc import _unwrap
@@ -273,12 +274,111 @@ def compute_tbdr(pass_details: list) -> dict:
     }
 
 
+def _fmt_attr_size_bytes(fmt: str) -> int:
+    """Return byte size for a vertex attribute format like 'R32G32B32_FLOAT'."""
+    if not fmt:
+        return 0
+    base = fmt.split("_")[0]  # e.g. "R32G32B32"
+    m = re.search(r"R(\d+)", base)
+    if not m:
+        return 0
+    bits = int(m.group(1))
+    comps = len(re.findall(r"[RGBA]\d+", base))
+    return max(1, (comps * bits + 7) // 8)
+
+
+# Attribute semantics that can typically use compressed formats
+_COMPRESSIBLE_SEMANTICS = {"NORMAL", "TANGENT", "BINORMAL", "COLOR", "TEXCOORD",
+                           "UV", "UV2", "TEXCOORD0", "TEXCOORD1"}
+_LARGE_FLOAT_FMTS = {"R32G32B32A32_FLOAT", "R32G32B32_FLOAT", "R32G32_FLOAT", "R32_FLOAT"}
+
+
+def compute_vertex_efficiency(meshes: dict) -> dict:
+    """Detect vertex buffer inefficiencies: low index reuse, oversized attribute formats, stride padding.
+
+    Returns available=False when no mesh data (collect.py run without --export-assets).
+    """
+    if not meshes:
+        return {"available": False, "reason": "No mesh data — re-run collect.py with --export-assets"}
+
+    issues_list = []
+    for eid_str, m in meshes.items():
+        if not isinstance(m, dict) or m.get("dedup_of"):
+            continue
+        vertex_count = m.get("vertex_count", 0)
+        index_count = m.get("index_count", 0)
+        stride = m.get("vertex_stride_bytes", 0)
+        vertex_format = m.get("vertex_format") or []
+        if vertex_count == 0:
+            continue
+
+        reuse_ratio = round(index_count / vertex_count, 2) if vertex_count > 0 else 0.0
+        local_issues = []
+
+        # Check 1: no index buffer
+        if index_count == 0:
+            local_issues.append({
+                "type": "no_index_buffer",
+                "recommendation": "Add an index buffer to enable vertex cache reuse",
+            })
+        elif reuse_ratio < 1.5:
+            local_issues.append({
+                "type": "low_index_reuse",
+                "reuse_ratio": reuse_ratio,
+                "recommendation": f"Index reuse {reuse_ratio}x < 1.5x — vertex cache may be underutilised",
+            })
+
+        # Check 2: oversized attribute format (R32 where R16 would suffice)
+        for attr in vertex_format:
+            sem = attr.get("semantic", "")
+            fmt = attr.get("format", "")
+            if fmt in _LARGE_FLOAT_FMTS and sem in _COMPRESSIBLE_SEMANTICS:
+                local_issues.append({
+                    "type": "oversized_attribute",
+                    "semantic": sem,
+                    "format": fmt,
+                    "recommendation": f"{sem}: {fmt} → consider R16G16B16A16_SNORM/UNORM (50% savings)",
+                })
+
+        # Check 3: stride padding (actual > estimated float32 stride by > 4 bytes)
+        if stride > 0 and vertex_format:
+            est_stride = sum(_fmt_attr_size_bytes(a.get("format", "")) for a in vertex_format)
+            if est_stride > 0 and stride > est_stride + 4:
+                local_issues.append({
+                    "type": "stride_padding",
+                    "actual_stride": stride,
+                    "estimated_stride": est_stride,
+                    "recommendation": f"Vertex stride {stride}B > attribute sum {est_stride}B — possible alignment padding",
+                })
+
+        if local_issues:
+            issues_list.append({
+                "eid": int(eid_str),
+                "file": m.get("file", ""),
+                "vertex_count": vertex_count,
+                "index_count": index_count,
+                "reuse_ratio": reuse_ratio,
+                "vertex_stride_bytes": stride,
+                "vertex_format": vertex_format,
+                "issues": local_issues,
+            })
+
+    total = len([m for m in meshes.values() if isinstance(m, dict) and not m.get("dedup_of")])
+    return {
+        "available": True,
+        "meshes_analyzed": total,
+        "meshes_with_issues": len(issues_list),
+        "issues": issues_list,
+    }
+
+
 def compute_analysis(
     summary: dict,
     pass_details: list,
     pipelines: dict,
     resource_details: dict,
     binding_views: dict | None = None,
+    meshes: dict | None = None,
 ) -> dict:
     """Run computed analysis on collected data. Returns dict for computed.json."""
     result: dict = {}
@@ -394,6 +494,9 @@ def compute_analysis(
 
     # ── TBDR tile load/store efficiency ──
     result["tbdr"] = compute_tbdr(pass_details)
+
+    # ── Vertex buffer efficiency (only when --export-assets was used) ──
+    result["vertex_efficiency"] = compute_vertex_efficiency(meshes or {})
 
     return result
 

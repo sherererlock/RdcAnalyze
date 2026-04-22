@@ -413,7 +413,9 @@ def main() -> None:
         # ── Step 7: Computed analysis ──
         print("\n[Step 7] Running computed analysis ...")
         t0 = time.time()
-        computed = compute_analysis(summary, pass_details, pipelines, resource_details, binding_views)
+        # Collect meshes dict if --export-assets was used (may be all_meshes or meshes depending on path)
+        _export_meshes: dict = locals().get("all_meshes") or locals().get("meshes") or {}
+        computed = compute_analysis(summary, pass_details, pipelines, resource_details, binding_views, _export_meshes)
         write_json(json_dir / "computed.json", computed)
         timings["computed"] = time.time() - t0
         print(f"  Done: computed analysis")

@@ -179,6 +179,17 @@ def _export_one_mesh(
     fbx_data = _expand_by_indices(attr_data, indices)
     attrs = [k for k in fbx_data if k != "IDX"]
 
+    # Fetch per-attribute format and input VBO stride for vertex efficiency analysis
+    vinputs_raw = run_rdc_json("cat", f"/draws/{eid}/pipeline/vertex-inputs", session=session, timeout=30) or {}
+    vbuffers_raw = run_rdc_json("cat", f"/draws/{eid}/pipeline/vbuffers", session=session, timeout=30) or {}
+    vertex_format = [
+        {"semantic": vi.get("name", ""), "format": vi.get("format", "")}
+        for vi in (vinputs_raw.get("inputs") or [])
+    ]
+    vb_list = vbuffers_raw.get("vbuffers") or []
+    vertex_stride_bytes = vb_list[0].get("byteStride", 0) if vb_list else 0
+    index_count = mesh_info.get("index_count", len(indices))
+
     out_file = meshes_dir / f"mesh_{eid}.fbx"
     try:
         write_fbx(out_file, f"draw_{eid}", fbx_data)
@@ -192,6 +203,9 @@ def _export_one_mesh(
     return {
         "file": f"meshes/mesh_{eid}.fbx",
         "vertex_count": mesh_info["vertex_count"],
+        "index_count": index_count,
+        "vertex_stride_bytes": vertex_stride_bytes,
+        "vertex_format": vertex_format,
         "attributes": attrs,
         "size_bytes": out_file.stat().st_size,
         "_eid": eid,

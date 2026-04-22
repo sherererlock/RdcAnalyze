@@ -30,6 +30,7 @@ from shared import (
     analyze_spirv_instructions, estimate_register_pressure, deduplicate_shaders,
     STAGE_COLORS, write_json,
 )
+from render_graph import _extract_subpasses
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -55,6 +56,7 @@ def load_analysis(analysis_dir: Path) -> dict:
         "pipelines": "pipelines.json",
         "bindings": "bindings.json",
         "collection": "_collection.json",
+        "meshes": "meshes.json",
     }
     json_dir = analysis_dir / "json"
     if not json_dir.is_dir():
@@ -63,6 +65,15 @@ def load_analysis(analysis_dir: Path) -> dict:
         data[key] = _load_json(json_dir / fname)
     data["analysis_dir"] = str(analysis_dir)
     data["shaders_dir"] = analysis_dir / "shaders"
+    # Build named subpasses from event marker hierarchy when available.
+    # For OpenGL captures _extract_subpasses() produces meaningful engine-level
+    # groups (e.g. "DrawOpaqueObjects") instead of per-framebuffer-binding auto
+    # names ("Depth-only Pass #1"). For Vulkan without debug markers it falls
+    # back to pass_details, so existing behaviour is preserved.
+    data["subpasses"] = _extract_subpasses(
+        data.get("summary") or {},
+        data.get("pass_details") or [],
+    )
     return data
 
 
@@ -137,10 +148,14 @@ def analyze_frame_overview(data: dict) -> dict:
         if isinstance(d, dict):
             draw_types[d.get("type", "unknown")] += 1
 
-    # Detect resolution from pass_details
+    # Use subpasses (event-marker based) as authoritative pass list when available
+    subpasses = data.get("subpasses") or []
     pass_details = data.get("pass_details") or []
+    active_passes = subpasses if subpasses else pass_details
+
+    # Detect resolution from active passes
     resolution = ""
-    for p in pass_details:
+    for p in active_passes:
         for ct in (p.get("color_targets") or []):
             w, h = ct.get("width", 0), ct.get("height", 0)
             if w > 0 and h > 0:
@@ -150,7 +165,7 @@ def analyze_frame_overview(data: dict) -> dict:
             break
 
     # Detect rendering architecture
-    pass_names = [p.get("name", "").lower() for p in passes]
+    pass_names = [p.get("name", "").lower() for p in active_passes]
     has_gbuffer = any("gbuffer" in n or "g-buffer" in n for n in pass_names)
     arch = "Deferred" if has_gbuffer else "Forward"
 
@@ -170,19 +185,22 @@ def analyze_frame_overview(data: dict) -> dict:
         "total_dispatches": total_dispatches,
         "total_triangles": total_tri,
         "draw_types": dict(draw_types),
-        "pass_count": len(passes),
+        "pass_count": len(active_passes),
         "architecture": arch,
         "clears": info.get("Clears", 0),
     }
 
 
 def analyze_pipeline(data: dict) -> dict:
-    pass_details = data.get("pass_details") or []
+    subpasses = data.get("subpasses") or []
+    active_passes = subpasses if subpasses else (data.get("pass_details") or [])
     result = []
-    for p in pass_details:
+    for p in active_passes:
         p_draws = p.get("draws", 0)
         p_dispatches = p.get("dispatches", 0)
-        cat = _classify_pass(p.get("name", ""), draws=p_draws, dispatches=p_dispatches)
+        # display_name is set by _extract_subpasses for disambiguated duplicate names
+        name = p.get("display_name") or p.get("name", "")
+        cat = _classify_pass(name, draws=p_draws, dispatches=p_dispatches)
         color_targets = p.get("color_targets") or []
         depth_target = p.get("depth_target")
         rt_info = []
@@ -200,7 +218,7 @@ def analyze_pipeline(data: dict) -> dict:
                 "is_depth": True,
             })
         result.append({
-            "name": p.get("name", ""),
+            "name": name,
             "category": cat,
             "color": _PASS_CAT_COLORS.get(cat, "#555f78"),
             "draws": p.get("draws", 0),
@@ -227,9 +245,25 @@ def analyze_hotspots(data: dict) -> dict:
     top_draws = sorted_draws[:15]
     max_tri = top_draws[0]["triangles"] if top_draws else 1
 
-    # Per-pass triangle distribution
-    tri_dist = computed.get("triangle_distribution", {})
-    per_pass = tri_dist.get("per_pass", [])
+    # Per-pass triangle distribution — use subpasses (event-marker based) so
+    # OpenGL captures get named passes instead of all draws lumped into pass="-"
+    subpasses = data.get("subpasses") or []
+    total_tri = sum(d.get("triangles", 0) for d in draws if isinstance(d, dict))
+    if subpasses:
+        sp_total = sum(s.get("triangles", 0) for s in subpasses)
+        sp_total = sp_total or total_tri or 1
+        per_pass = [
+            {
+                "name": s.get("display_name") or s.get("name", ""),
+                "triangles": s.get("triangles", 0),
+                "percent": round(s.get("triangles", 0) / sp_total * 100, 1),
+            }
+            for s in sorted(subpasses, key=lambda s: -s.get("triangles", 0))
+            if s.get("triangles", 0) > 0
+        ]
+    else:
+        tri_dist = computed.get("triangle_distribution", {})
+        per_pass = tri_dist.get("per_pass", [])
 
     # Detect repeated mesh draws (same triangle count appearing in multiple passes)
     tri_counts: dict[int, list] = defaultdict(list)
@@ -247,11 +281,12 @@ def analyze_hotspots(data: dict) -> dict:
                 "eids": [d["eid"] for d in draw_list],
             })
 
+    tri_dist = computed.get("triangle_distribution", {})
     return {
         "top_draws": top_draws,
         "max_tri": max_tri,
         "per_pass": per_pass,
-        "total_triangles": tri_dist.get("total", 0),
+        "total_triangles": tri_dist.get("total", 0) or total_tri,
         "repeated_meshes": repeated_meshes,
     }
 
@@ -499,10 +534,21 @@ def analyze_tbdr(data: dict) -> dict:
     return {"available": False, "reason": "No TBDR data — re-run collect.py to generate computed.json"}
 
 
+def analyze_vertex_efficiency(data: dict) -> dict:
+    """Return vertex buffer efficiency analysis from computed.json."""
+    computed = data.get("computed") or {}
+    ve = computed.get("vertex_efficiency")
+    if ve is not None:
+        return ve
+    return {"available": False, "reason": "No vertex efficiency data — re-run collect.py with --export-assets"}
+
+
 def analyze_pipeline_stages(data: dict) -> dict:
     """Classify each pass into a pipeline stage using metadata heuristics."""
     summary = data.get("summary") or {}
-    pass_details = data.get("pass_details") or []
+    # Use event-marker-based subpasses when available (correct for OpenGL/GLES).
+    subpasses = data.get("subpasses") or []
+    pass_details = subpasses if subpasses else (data.get("pass_details") or [])
     draws_list = _unwrap(summary.get("draws"), "draws") or []
 
     counters_raw = summary.get("counters") or {}
@@ -572,7 +618,7 @@ def analyze_pipeline_stages(data: dict) -> dict:
     stage_counts: dict[str, int] = {}
 
     for p in pass_details:
-        name = p.get("name", "")
+        name = p.get("display_name") or p.get("name", "")
         begin_eid = p.get("begin_eid", 0)
         end_eid = p.get("end_eid", 0)
 
@@ -873,6 +919,45 @@ def generate_suggestions(analysis: dict, data: dict) -> list[dict]:
                     "or whether alpha-tested/transparent draws are mixed with opaques."
                 ),
                 "category": "Overdraw",
+            })
+
+    # 9. Vertex buffer efficiency
+    ve = analysis.get("vertex_efficiency") or {}
+    if ve.get("available"):
+        ve_issues = ve.get("issues") or []
+        no_ib = [i for i in ve_issues if any(x["type"] == "no_index_buffer" for x in i.get("issues", []))]
+        oversized = [i for i in ve_issues if any(x["type"] == "oversized_attribute" for x in i.get("issues", []))]
+        low_reuse = [i for i in ve_issues if any(x["type"] == "low_index_reuse" for x in i.get("issues", []))]
+        if no_ib:
+            suggestions.append({
+                "severity": "warning",
+                "title": f"Index buffer missing on {len(no_ib)} draw(s)",
+                "detail": (
+                    f"{len(no_ib)} draw call(s) have no index buffer, preventing vertex cache reuse. "
+                    "Adding an index buffer typically reduces vertex count by 30–50% on regular meshes."
+                ),
+                "category": "Geometry",
+            })
+        if low_reuse:
+            avg_r = round(sum(i["reuse_ratio"] for i in low_reuse) / len(low_reuse), 2)
+            suggestions.append({
+                "severity": "info",
+                "title": f"Low index reuse on {len(low_reuse)} draw(s) (avg {avg_r}x)",
+                "detail": (
+                    f"{len(low_reuse)} draw call(s) have index reuse ratio below 1.5x. "
+                    "Consider mesh optimisation (vertex cache ordering) or merging small meshes."
+                ),
+                "category": "Geometry",
+            })
+        if oversized:
+            suggestions.append({
+                "severity": "info",
+                "title": f"Oversized vertex attributes on {len(oversized)} draw(s)",
+                "detail": (
+                    f"{len(oversized)} draw call(s) use full float32 for NORMAL/TANGENT/UV attributes. "
+                    "Switching to 16-bit normalised formats (R16G16_SNORM) halves vertex buffer bandwidth."
+                ),
+                "category": "Geometry",
             })
 
     # Sort: warning first, then info
@@ -1668,6 +1753,61 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     </div>
     """
 
+    # Section 12: Vertex Buffer Efficiency
+    ve_data = analysis.get("vertex_efficiency") or {}
+    if not ve_data.get("available"):
+        ve_reason = ve_data.get("reason", "No vertex efficiency data")
+        vertex_html = f'<p class="text-muted">{_esc(ve_reason)}</p>'
+    else:
+        ve_issues = ve_data.get("issues") or []
+        ve_total = ve_data.get("meshes_analyzed", 0)
+        ve_issue_count = ve_data.get("meshes_with_issues", 0)
+        if not ve_issues:
+            vertex_html = f'<p class="text-muted">No issues found in {ve_total} analysed meshes.</p>'
+        else:
+            issue_rows = []
+            for item in ve_issues:
+                for iss in (item.get("issues") or []):
+                    itype = iss.get("type", "")
+                    color = "#ef4444" if itype == "no_index_buffer" else "#f97316" if itype == "low_index_reuse" else "#64748b"
+                    sem_fmt = ""
+                    if iss.get("semantic"):
+                        sem_fmt = f'{_esc(iss["semantic"])} · {_esc(iss.get("format", ""))}'
+                    issue_rows.append(
+                        f'<tr>'
+                        f'<td class="num">{item.get("eid", "")}</td>'
+                        f'<td style="font-size:11px">{_esc(item.get("file", ""))}</td>'
+                        f'<td class="num">{_fmt_number(item.get("vertex_count", 0))}</td>'
+                        f'<td class="num">{_fmt_number(item.get("index_count", 0))}</td>'
+                        f'<td class="num">{item.get("reuse_ratio", 0.0):.2f}x</td>'
+                        f'<td class="num">{item.get("vertex_stride_bytes", 0)}</td>'
+                        f'<td><span style="color:{color};font-weight:600">{_esc(itype)}</span></td>'
+                        f'<td style="font-size:11px">{sem_fmt}</td>'
+                        f'<td style="font-size:11px">{_esc(iss.get("recommendation", ""))}</td>'
+                        f'</tr>'
+                    )
+            vertex_html = f"""
+    <div class="mini-cards">
+      <div class="mini-card">
+        <div class="mini-label">Meshes Analysed</div>
+        <div class="mini-value">{ve_total}</div>
+      </div>
+      <div class="mini-card">
+        <div class="mini-label">Meshes with Issues</div>
+        <div class="mini-value">{ve_issue_count}</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+    <table class="data-table sortable">
+      <thead><tr>
+        <th>EID</th><th>File</th><th>Vertices</th><th>Indices</th><th>Reuse</th>
+        <th>Stride</th><th>Issue</th><th>Attribute</th><th>Recommendation</th>
+      </tr></thead>
+      <tbody>{"".join(issue_rows)}</tbody>
+    </table>
+    </div>
+    """
+
     # Section 11: Suggestions
     suggestion_cards = []
     for s in suggestions:
@@ -2342,9 +2482,18 @@ h4 {{
     <div class="section-body">{tbdr_html}</div>
   </div>
 
+  <div class="section" id="sec-vertex">
+    <div class="section-header" onclick="toggleSection('sec-vertex')">
+      <span class="section-num">11</span>
+      <h2>Vertex Buffer Efficiency</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="section-body">{vertex_html}</div>
+  </div>
+
   <div class="section" id="sec-suggestions">
     <div class="section-header" onclick="toggleSection('sec-suggestions')">
-      <span class="section-num">11</span>
+      <span class="section-num">12</span>
       <h2>Optimization Suggestions</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -2428,6 +2577,7 @@ def main():
         "overdraw": analyze_overdraw(data),
         "mipmap_usage": analyze_mipmap_usage(data),
         "tbdr": analyze_tbdr(data),
+        "vertex_efficiency": analyze_vertex_efficiency(data),
     }
     analysis["suggestions"] = generate_suggestions(analysis, data)
 

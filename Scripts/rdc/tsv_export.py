@@ -276,6 +276,33 @@ def _build_tbdr(computed: dict) -> tuple[list[str], list[list]]:
     return headers, rows
 
 
+def _build_vertex_efficiency(computed: dict) -> tuple[list[str], list[list]]:
+    ve = (computed or {}).get("vertex_efficiency") or {}
+    if not ve.get("available"):
+        return [], []
+    issues = ve.get("issues") or []
+    if not issues:
+        return [], []
+    headers = ["eid", "file", "vertex_count", "index_count", "reuse_ratio",
+               "stride_bytes", "issue_type", "semantic", "format", "recommendation"]
+    rows = []
+    for item in issues:
+        for issue in (item.get("issues") or []):
+            rows.append([
+                item.get("eid", ""),
+                item.get("file", ""),
+                item.get("vertex_count", 0),
+                item.get("index_count", 0),
+                item.get("reuse_ratio", 0.0),
+                item.get("vertex_stride_bytes", 0),
+                issue.get("type", ""),
+                issue.get("semantic", ""),
+                issue.get("format", ""),
+                issue.get("recommendation", ""),
+            ])
+    return headers, rows
+
+
 def _build_alerts(computed: dict) -> tuple[list[str], list[list]]:
     alerts = computed.get("alerts") or []
     if not alerts:
@@ -586,6 +613,10 @@ def export_tsv(
     tbh, tbr = _build_tbdr(computed or {})
     if tbh:
         tables["tbdr_efficiency"] = (tbh, tbr)
+
+    veh, ver = _build_vertex_efficiency(computed or {})
+    if veh:
+        tables["vertex_efficiency"] = (veh, ver)
 
     counters_by_eid = _build_counters_by_eid(summary)
     sh, sr, sumh, sumr = _build_pipeline_stages(summary, pass_details, counters_by_eid)
