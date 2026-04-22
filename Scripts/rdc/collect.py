@@ -25,6 +25,7 @@ if sys.version_info < (3, 10):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
+import json
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -381,10 +382,38 @@ def main() -> None:
         # POST-MERGE PHASE
         # ═══════════════════════════════════════════════════════════════
 
+        # ── Step 6.8: Mip view collection (per-pass descriptor sampling) ──
+        print("\n[Step 6.8] Collecting mip view data ...")
+        t0 = time.time()
+        binding_views: dict = {}
+        _mip_tmpl = Path(__file__).resolve().parent / "collect_mip_views.py"
+        if _mip_tmpl.exists():
+            _mip_run = json_dir / "_collect_mip_views_run.py"
+            _mip_content = _mip_tmpl.read_text(encoding="utf-8").replace(
+                '"__ANALYSIS_DIR__"', repr(str(out_dir))
+            )
+            _mip_run.write_text(_mip_content, encoding="utf-8")
+            _, mip_err, mip_rc = run_rdc("script", str(_mip_run), session=sess, timeout=300)
+            _bv_path = json_dir / "binding_views.json"
+            if mip_rc == 0 and _bv_path.exists():
+                try:
+                    binding_views = json.loads(_bv_path.read_text(encoding="utf-8"))
+                    print(f"  Collected mip views for {len(binding_views)} passes")
+                except json.JSONDecodeError as exc:
+                    errors.append({"phase": "mip_views", "error": f"JSON: {exc}"})
+                    print("  WARNING: binding_views.json parse failed")
+            else:
+                if mip_err:
+                    errors.append({"phase": "mip_views", "error": mip_err[:300]})
+                print(f"  WARNING: mip view collection skipped (rc={mip_rc})")
+        else:
+            print("  WARNING: collect_mip_views.py not found, skipping")
+        timings["mip_views"] = time.time() - t0
+
         # ── Step 7: Computed analysis ──
         print("\n[Step 7] Running computed analysis ...")
         t0 = time.time()
-        computed = compute_analysis(summary, pass_details, pipelines, resource_details)
+        computed = compute_analysis(summary, pass_details, pipelines, resource_details, binding_views)
         write_json(json_dir / "computed.json", computed)
         timings["computed"] = time.time() - t0
         print(f"  Done: computed analysis")

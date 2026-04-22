@@ -237,33 +237,39 @@ pass    eid_range    rt_size    rt_pixels    ps_invocations    overdraw    sever
 
 #### 实施细节
 
-**Step 1：新增采集脚本 `Scripts/rdc/collect_mip_views.py`**（或内联进 `collect.py` 作为新步骤），通过 `rdc-cli script` 一次性扫描所有 draw 的 descriptor set，输出 `json/binding_views.json`：
+**Step 1：新增采集脚本 `Scripts/rdc/collect_mip_views.py`**（或内联进 `collect.py` 作为新步骤），通过 `rdc-cli script` 按 pass 采样 descriptor set，输出 `json/binding_views.json`。
+
+**采样策略**：只取每个 pass 的 `begin_eid`（来自已有 `passes.json`），而非遍历全部 draw。Pass 内 descriptor set 绑定通常在 pass 级别统一更新，per-draw 切换同一 slot 纹理极罕见，精度损失可接受，`SetFrameEvent` 调用次数从数百次降至 ~20-50 次。
 
 ```python
 # 脚本在 daemon 内执行，rd / controller 已注入
+import json, pathlib
+
+passes_path = pathlib.Path(__ANALYSIS_DIR__) / "json" / "passes.json"
+passes = json.loads(passes_path.read_text(encoding="utf-8"))
+sample_eids = [p["begin_eid"] for p in passes if p.get("begin_eid") is not None]
+
 result = {}  # {str(eid): [{set, bind, resource_id, first_mip, num_mips}]}
-for action in controller.GetRootActions():
-    for draw in _iter_draws(action):
-        eid = draw.eventId
-        controller.SetFrameEvent(eid, False)
-        state = controller.GetVulkanPipelineState()
-        entries = []
-        for set_idx, ds in enumerate(state.graphics.descriptorSets):
-            dr = rd.DescriptorRange()
-            dr.offset = 0
-            dr.count = 64  # 每组最多取 64 个 descriptor
-            descs = controller.GetDescriptors(ds.descriptorSetResourceId, [dr])
-            for d in descs:
-                rid = int(str(d.resource).split("::")[-1])
-                if rid == 0:
-                    continue
-                entries.append({
-                    "set": set_idx, "bind": int(d.byteOffset),
-                    "resource_id": rid,
-                    "first_mip": d.firstMip, "num_mips": d.numMips,
-                })
-        if entries:
-            result[str(eid)] = entries
+for eid in sample_eids:
+    controller.SetFrameEvent(eid, False)
+    state = controller.GetVulkanPipelineState()
+    entries = []
+    for set_idx, ds in enumerate(state.graphics.descriptorSets):
+        dr = rd.DescriptorRange()
+        dr.offset = 0
+        dr.count = 64  # 每组最多取 64 个 descriptor
+        descs = controller.GetDescriptors(ds.descriptorSetResourceId, [dr])
+        for d in descs:
+            rid = int(str(d.resource).split("::")[-1])
+            if rid == 0:
+                continue
+            entries.append({
+                "set": set_idx, "bind": int(d.byteOffset),
+                "resource_id": rid,
+                "first_mip": d.firstMip, "num_mips": d.numMips,
+            })
+    if entries:
+        result[str(eid)] = entries
 ```
 
 **输出 `json/binding_views.json` schema**：

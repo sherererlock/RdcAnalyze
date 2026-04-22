@@ -87,11 +87,87 @@ def compute_overdraw(summary: dict, pass_details: list) -> dict:
     }
 
 
+def compute_mipmap_usage(binding_views: dict, resource_details: dict) -> dict:
+    """Detect textures with mip levels outside any view range (view-level waste).
+
+    binding_views: {str(eid): [{resource_id, first_mip, num_mips, ...}]}
+    Samples one EID per pass, so view ranges represent pass-level bindings.
+    """
+    viewed_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for entries in binding_views.values():
+        for e in entries:
+            rid = e.get("resource_id")
+            first = e.get("first_mip", 0)
+            num = e.get("num_mips", 0)
+            if rid and num > 0:
+                viewed_ranges[rid].append((first, first + num))
+
+    per_texture: list[dict] = []
+    total_wasted_mb = 0.0
+
+    for rid_str, rdata in resource_details.items():
+        if not isinstance(rdata, dict) or "_error" in rdata:
+            continue
+        rtype = (rdata.get("type") or "").lower()
+        if "texture" not in rtype and "image" not in rtype:
+            continue
+        total_mips = rdata.get("mips", 1) or 1
+        if total_mips <= 1:
+            continue
+
+        rid = rdata.get("id")
+        if rid is None:
+            try:
+                rid = int(rid_str)
+            except (ValueError, TypeError):
+                continue
+
+        ranges = viewed_ranges.get(rid)
+        if not ranges:
+            continue
+
+        viewed: set[int] = set()
+        for (first, end) in ranges:
+            viewed.update(range(first, min(end, total_mips)))
+
+        unviewed = [k for k in range(total_mips) if k not in viewed]
+        if not unviewed:
+            continue
+
+        # Mip k occupies 0.25^k relative to mip 0 (area quarters each level)
+        total_weight = sum(0.25 ** k for k in range(total_mips))
+        wasted_weight = sum(0.25 ** k for k in unviewed)
+        tex_mb = estimate_texture_mb(rdata)
+        wasted_mb = tex_mb * (wasted_weight / total_weight) if total_weight > 0 else 0.0
+        if wasted_mb <= 0:
+            continue
+
+        first_viewed = min(viewed)
+        last_viewed = max(viewed)
+        per_texture.append({
+            "resource_id": rid,
+            "name": rdata.get("name", ""),
+            "total_mips": total_mips,
+            "viewed_mip_range": [first_viewed, last_viewed],
+            "unviewed_mips": unviewed,
+            "wasted_mb": round(wasted_mb, 3),
+            "recommendation": f"Reduce mips from {total_mips} to {last_viewed + 1}",
+        })
+        total_wasted_mb += wasted_mb
+
+    per_texture.sort(key=lambda x: -x["wasted_mb"])
+    return {
+        "per_texture": per_texture,
+        "total_wasted_mb": round(total_wasted_mb, 3),
+    }
+
+
 def compute_analysis(
     summary: dict,
     pass_details: list,
     pipelines: dict,
     resource_details: dict,
+    binding_views: dict | None = None,
 ) -> dict:
     """Run computed analysis on collected data. Returns dict for computed.json."""
     result: dict = {}
@@ -201,6 +277,9 @@ def compute_analysis(
 
     # ── Overdraw estimation ──
     result["overdraw"] = compute_overdraw(summary, pass_details)
+
+    # ── Mipmap usage (view-level waste) ──
+    result["mipmap_usage"] = compute_mipmap_usage(binding_views or {}, resource_details)
 
     return result
 

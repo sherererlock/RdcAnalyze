@@ -226,6 +226,31 @@ def _build_overdraw(computed: dict) -> tuple[list[str], list[list]]:
     return headers, rows
 
 
+def _build_mipmap_usage(computed: dict) -> tuple[list[str], list[list]]:
+    mu = (computed or {}).get("mipmap_usage") or {}
+    per_texture = mu.get("per_texture") or []
+    if not per_texture:
+        return [], []
+    headers = [
+        "resource_id", "name", "total_mips", "viewed_range",
+        "unviewed_mips", "wasted_mb", "recommendation",
+    ]
+    rows = []
+    for t in per_texture:
+        vr = t.get("viewed_mip_range") or [0, 0]
+        unviewed = t.get("unviewed_mips") or []
+        rows.append([
+            t.get("resource_id", ""),
+            t.get("name", ""),
+            t.get("total_mips", 0),
+            f"{vr[0]}-{vr[1]}",
+            ",".join(str(k) for k in unviewed),
+            t.get("wasted_mb", 0.0),
+            t.get("recommendation", ""),
+        ])
+    return headers, rows
+
+
 def _build_alerts(computed: dict) -> tuple[list[str], list[list]]:
     alerts = computed.get("alerts") or []
     if not alerts:
@@ -528,6 +553,10 @@ def export_tsv(
     odh, odr = _build_overdraw(computed or {})
     if odh:
         tables["overdraw"] = (odh, odr)
+
+    muh, mur = _build_mipmap_usage(computed or {})
+    if muh:
+        tables["mipmap_usage"] = (muh, mur)
 
     counters_by_eid = _build_counters_by_eid(summary)
     sh, sr, sumh, sumr = _build_pipeline_stages(summary, pass_details, counters_by_eid)

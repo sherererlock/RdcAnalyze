@@ -481,6 +481,15 @@ def analyze_overdraw(data: dict) -> dict:
     return {"available": False, "reason": "No overdraw data — re-run collect.py to generate computed.json"}
 
 
+def analyze_mipmap_usage(data: dict) -> dict:
+    """Return mipmap view-level waste analysis from computed.json."""
+    computed = data.get("computed") or {}
+    mu = computed.get("mipmap_usage")
+    if mu is not None:
+        return mu
+    return {"per_texture": [], "total_wasted_mb": 0.0}
+
+
 def analyze_pipeline_stages(data: dict) -> dict:
     """Classify each pass into a pipeline stage using metadata heuristics."""
     summary = data.get("summary") or {}
@@ -888,6 +897,7 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     memory = analysis["memory"]
     suggestions = analysis["suggestions"]
     overdraw_data = analysis.get("overdraw") or {}
+    mipmap_data = analysis.get("mipmap_usage") or {}
 
     # ── Build HTML sections ──
 
@@ -1506,7 +1516,53 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
         od_reason = overdraw_data.get("reason", "No overdraw data available")
         overdraw_html = f'<p class="text-muted">{_esc(od_reason)}</p>'
 
-    # Section 9: Suggestions
+    # Section 9: Mipmap Usage
+    mu_per_texture = mipmap_data.get("per_texture") or []
+    mu_total_wasted = mipmap_data.get("total_wasted_mb", 0.0)
+    if mu_per_texture:
+        mu_table_rows = []
+        for t in mu_per_texture:
+            vr = t.get("viewed_mip_range") or [0, 0]
+            unviewed = t.get("unviewed_mips") or []
+            wasted = t.get("wasted_mb", 0.0)
+            color = "#ef4444" if wasted >= 1.0 else "#f97316" if wasted >= 0.1 else "#6b7280"
+            mu_table_rows.append(
+                f'<tr>'
+                f'<td>{_esc(t.get("name", str(t.get("resource_id", ""))))}</td>'
+                f'<td class="num">{t.get("total_mips", 0)}</td>'
+                f'<td class="num">{vr[0]}–{vr[1]}</td>'
+                f'<td class="num">{", ".join(str(k) for k in unviewed)}</td>'
+                f'<td class="num" style="color:{color};font-weight:600">{wasted:.3f}</td>'
+                f'<td>{_esc(t.get("recommendation", ""))}</td>'
+                f'</tr>'
+            )
+        mipmap_html = f"""
+    <div class="mini-cards">
+      <div class="mini-card">
+        <div class="mini-label">Total Wasted</div>
+        <div class="mini-value">{mu_total_wasted:.2f} MB</div>
+      </div>
+      <div class="mini-card">
+        <div class="mini-label">Affected Textures</div>
+        <div class="mini-value">{len(mu_per_texture)}</div>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text-muted);margin:4px 0 12px">
+      View-level waste: mip layers outside all VkImageView ranges — never accessible by any shader.
+    </p>
+    <div class="table-wrap">
+    <table class="data-table sortable">
+      <thead><tr>
+        <th>Texture</th><th>Total Mips</th><th>Viewed Range</th><th>Unviewed Mips</th><th>Wasted MB</th><th>Recommendation</th>
+      </tr></thead>
+      <tbody>{"".join(mu_table_rows)}</tbody>
+    </table>
+    </div>
+    """
+    else:
+        mipmap_html = '<p class="text-muted">No mipmap view-level waste detected (or binding_views.json not available — re-run collect.py).</p>'
+
+    # Section 10: Suggestions
     suggestion_cards = []
     for s in suggestions:
         suggestion_cards.append(
@@ -2162,9 +2218,18 @@ h4 {{
     <div class="section-body">{overdraw_html}</div>
   </div>
 
+  <div class="section" id="sec-mipmap">
+    <div class="section-header" onclick="toggleSection('sec-mipmap')">
+      <span class="section-num">09</span>
+      <h2>Mipmap Usage</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="section-body">{mipmap_html}</div>
+  </div>
+
   <div class="section" id="sec-suggestions">
     <div class="section-header" onclick="toggleSection('sec-suggestions')">
-      <span class="section-num">09</span>
+      <span class="section-num">10</span>
       <h2>Optimization Suggestions</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -2246,6 +2311,7 @@ def main():
         "shaders": analyze_shaders(data),
         "memory": analyze_memory(data),
         "overdraw": analyze_overdraw(data),
+        "mipmap_usage": analyze_mipmap_usage(data),
     }
     analysis["suggestions"] = generate_suggestions(analysis, data)
 
