@@ -10,6 +10,7 @@ from rpc import _unwrap
 from shared import (
     classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad,
     analyze_spirv_instructions, estimate_register_pressure, deduplicate_shaders,
+    guess_bpp, estimate_texture_mb, rt_bytes,
 )
 
 
@@ -576,6 +577,191 @@ def _build_shader_pass_matrix(
     return headers, rows
 
 
+def _build_mesh_specs(
+    mesh_specs: dict,
+    summary: dict,
+    pipelines: dict,
+) -> tuple[list[str], list[list]]:
+    if not mesh_specs:
+        return [], []
+    headers = [
+        "eid", "pass", "marker", "type", "topology",
+        "vertex_count", "index_count", "triangles", "instances", "indexed", "reuse_ratio",
+    ]
+    # Build a draw lookup by eid for fast access
+    draws = _unwrap(summary.get("draws"), "draws") or []
+    draw_by_eid: dict = {d["eid"]: d for d in draws if isinstance(d, dict) and "eid" in d}
+    rows = []
+    for eid_str in sorted(mesh_specs, key=lambda k: int(k)):
+        m = mesh_specs[eid_str]
+        if not isinstance(m, dict):
+            continue
+        eid = m.get("eid", int(eid_str))
+        d = draw_by_eid.get(eid, {})
+        vc = m.get("vertex_count", 0)
+        ic = m.get("index_count", 0)
+        pipe = pipelines.get(eid_str) or {}
+        reuse = round(ic / vc, 2) if vc > 0 and ic > 0 else 0.0
+        rows.append([
+            eid,
+            d.get("pass", ""),
+            d.get("marker", ""),
+            d.get("type", ""),
+            pipe.get("topology", ""),
+            vc,
+            ic,
+            d.get("triangles", 0),
+            d.get("instances", 0),
+            m.get("indexed", ic > 0),
+            reuse,
+        ])
+    return headers, rows
+
+
+def _build_texture_specs(
+    resource_details: dict,
+    computed: dict | None,
+) -> tuple[list[str], list[list]]:
+    headers = [
+        "id", "name", "format", "width", "height", "depth", "array_size", "mips",
+        "bpp", "est_mb", "viewed_mip_range", "unviewed_mips", "byte_size",
+        "creation_flags", "gpu_address",
+    ]
+    mip_by_id: dict = {}
+    if computed:
+        mu = computed.get("mipmap_usage") or {}
+        for t in (mu.get("per_texture") or []):
+            if isinstance(t, dict) and "id" in t:
+                mip_by_id[t["id"]] = t
+    rows = []
+    for rid in sorted(resource_details, key=lambda k: int(k)):
+        r = resource_details[rid]
+        if not isinstance(r, dict) or r.get("type") != "Texture":
+            continue
+        fmt = r.get("format", "")
+        est_mb = round(estimate_texture_mb(r), 3)
+        bpp = round(guess_bpp(fmt), 2)
+        mip_info = mip_by_id.get(r.get("id"))
+        viewed_range = ""
+        unviewed = ""
+        if mip_info:
+            viewed_range = mip_info.get("viewed_mip_range", "")
+            unviewed = mip_info.get("unviewed_mips", "")
+        rows.append([
+            r.get("id", rid),
+            r.get("name", ""),
+            fmt,
+            r.get("width", ""),
+            r.get("height", ""),
+            r.get("depth", ""),
+            r.get("array_size", ""),
+            r.get("mips", ""),
+            bpp,
+            est_mb,
+            viewed_range,
+            unviewed,
+            r.get("byte_size", ""),
+            r.get("creation_flags", ""),
+            r.get("gpu_address", ""),
+        ])
+    return headers, rows
+
+
+def _build_buffer_specs(resource_details: dict) -> tuple[list[str], list[list]]:
+    headers = ["id", "name", "length", "byte_size", "creation_flags", "usage", "gpu_address"]
+    _usage_keywords = [
+        ("Vertex", "vertex"), ("Index", "index"),
+        ("Uniform", "uniform"), ("Storage", "storage"),
+        ("Constant", "uniform"), ("Structured", "storage"),
+    ]
+    rows = []
+    for rid in sorted(resource_details, key=lambda k: int(k)):
+        r = resource_details[rid]
+        if not isinstance(r, dict) or r.get("type") != "Buffer":
+            continue
+        flags = str(r.get("creation_flags") or "")
+        usage = next((tag for kw, tag in _usage_keywords if kw.lower() in flags.lower()), "")
+        rows.append([
+            r.get("id", rid),
+            r.get("name", ""),
+            r.get("length", ""),
+            r.get("byte_size", ""),
+            flags,
+            usage,
+            r.get("gpu_address", ""),
+        ])
+    return headers, rows
+
+
+def _parse_ops(ops_list: list | dict, role: str) -> str:
+    """Extract op string for a given role from load_ops/store_ops."""
+    if not ops_list:
+        return ""
+    if isinstance(ops_list, dict):
+        return str(ops_list.get(role, ""))
+    # list of [role_char, op_name] pairs
+    for entry in ops_list:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            if str(entry[0]).upper() == role.upper():
+                return str(entry[1])
+    return ""
+
+
+def _build_rendertarget_specs(pass_details: list) -> tuple[list[str], list[list]]:
+    """Build deduplicated RT specs (one row per unique resource)."""
+    headers = [
+        "attachment_name", "resource_id", "attachment_role",
+        "format", "width", "height", "samples", "bpp", "tile_mb",
+        "load_op", "store_op", "pass_count",
+    ]
+    by_key: dict = {}
+    for p in pass_details:
+        if not isinstance(p, dict):
+            continue
+        pass_name = p.get("name", "")
+        load_ops = p.get("load_ops") or []
+        store_ops = p.get("store_ops") or []
+        for i, ct in enumerate(p.get("color_targets") or []):
+            if not isinstance(ct, dict):
+                continue
+            key = (ct.get("id") or f'{ct.get("name")}|{ct.get("format")}|{ct.get("width")}|{ct.get("height")}')
+            if key not in by_key:
+                by_key[key] = [
+                    ct.get("name", ""), ct.get("id", ""), f"Color{i}",
+                    ct.get("format", ""), ct.get("width", ""), ct.get("height", ""),
+                    ct.get("samples", 1),
+                    round(guess_bpp(ct.get("format", "")), 2),
+                    round(rt_bytes(ct) / (1024 * 1024), 3),
+                    _parse_ops(load_ops, str(i)), _parse_ops(store_ops, str(i)), 1,
+                ]
+            else:
+                by_key[key][-1] += 1
+                if not by_key[key][9] and _parse_ops(load_ops, str(i)):
+                    by_key[key][9] = _parse_ops(load_ops, str(i))
+                if not by_key[key][10] and _parse_ops(store_ops, str(i)):
+                    by_key[key][10] = _parse_ops(store_ops, str(i))
+        dt = p.get("depth_target")
+        if isinstance(dt, dict):
+            key = (dt.get("id") or f'{dt.get("name")}|{dt.get("format")}|{dt.get("width")}|{dt.get("height")}')
+            if key not in by_key:
+                by_key[key] = [
+                    dt.get("name", ""), dt.get("id", ""), "Depth",
+                    dt.get("format", ""), dt.get("width", ""), dt.get("height", ""),
+                    dt.get("samples", 1),
+                    round(guess_bpp(dt.get("format", "")), 2),
+                    round(rt_bytes(dt) / (1024 * 1024), 3),
+                    _parse_ops(load_ops, "D"), _parse_ops(store_ops, "D"), 1,
+                ]
+            else:
+                by_key[key][-1] += 1
+                if not by_key[key][9] and _parse_ops(load_ops, "D"):
+                    by_key[key][9] = _parse_ops(load_ops, "D")
+                if not by_key[key][10] and _parse_ops(store_ops, "D"):
+                    by_key[key][10] = _parse_ops(store_ops, "D")
+    rows = sorted(by_key.values(), key=lambda r: -(r[8] or 0))
+    return headers, rows
+
+
 def export_tsv(
     tsv_dir: Path,
     summary: dict,
@@ -586,6 +772,7 @@ def export_tsv(
     shader_disasm: dict,
     computed: dict | None = None,
     shaders_dir: Path | None = None,
+    mesh_specs: dict | None = None,
 ) -> None:
     tsv_dir.mkdir(parents=True, exist_ok=True)
     tables = {
@@ -624,6 +811,23 @@ def export_tsv(
         tables["pipeline_stages"] = (sh, sr)
     if sumh:
         tables["stage_summary"] = (sumh, sumr)
+
+    # ── Resource spec tables ──
+    msh, msr = _build_mesh_specs(mesh_specs or {}, summary, pipelines)
+    if msh:
+        tables["mesh_specs"] = (msh, msr)
+
+    tsh, tsr = _build_texture_specs(resource_details, computed)
+    if tsh:
+        tables["texture_specs"] = (tsh, tsr)
+
+    bsh, bsr = _build_buffer_specs(resource_details)
+    if bsh:
+        tables["buffer_specs"] = (bsh, bsr)
+
+    rtsh, rtsr = _build_rendertarget_specs(pass_details)
+    if rtsh:
+        tables["rendertarget_specs"] = (rtsh, rtsr)
 
     dth, dtr = _build_draw_timing(summary, pass_details, counters_by_eid)
     if dth:

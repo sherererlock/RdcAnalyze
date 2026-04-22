@@ -459,6 +459,72 @@ def _collect_resources_shard(
     return results
 
 
+def _collect_mesh_specs_shard(
+    session: str,
+    eid_shard: list[int],
+    progress: Progress,
+    errors: ErrorCollector,
+) -> dict:
+    """Collect mesh vertex/index counts for a shard of draw EIDs (lightweight)."""
+    results: dict = {}
+    for eid in eid_shard:
+        progress.tick(f"EID {eid}")
+        data = run_rdc_json("mesh", str(eid), session=session)
+        if data is None:
+            errors.append({"phase": "mesh_specs", "eid": eid, "error": "failed"})
+            continue
+        vc = data.get("vertex_count") or 0
+        ic = data.get("index_count") or 0
+        if vc == 0:
+            continue
+        results[str(eid)] = {
+            "eid": eid,
+            "vertex_count": vc,
+            "index_count": ic,
+            "indexed": ic > 0,
+        }
+    return results
+
+
+def collect_mesh_specs(
+    draw_eids: list[int],
+    errors: ErrorCollector,
+    *,
+    session: str | None = None,
+    active_workers: list[str] | None = None,
+) -> dict:
+    """Collect lightweight mesh specs (vertex/index counts) for all draw EIDs.
+
+    When active_workers is provided, collection runs in parallel across shards.
+    Falls back to the provided session (or MAIN_SESSION) for serial collection.
+    """
+    if not draw_eids:
+        return {}
+    if active_workers and len(active_workers) > 1:
+        shards = _shard_list(draw_eids, len(active_workers))
+        progress = Progress(len(draw_eids), "Mesh specs")
+        results: dict = {}
+        with ThreadPoolExecutor(max_workers=len(active_workers)) as executor:
+            futures = {}
+            for wrk, shard in zip(active_workers, shards):
+                if shard:
+                    futures[executor.submit(
+                        _collect_mesh_specs_shard, wrk, shard, progress, errors
+                    )] = wrk
+            for future in as_completed(futures):
+                try:
+                    results.update(future.result())
+                except Exception as exc:
+                    errors.append({"phase": "mesh_specs", "error": str(exc)})
+        progress.done()
+        return results
+    # Serial path
+    from rpc import MAIN_SESSION
+    sess = session or MAIN_SESSION
+    progress = Progress(len(draw_eids), "Mesh specs")
+    return _collect_mesh_specs_shard(sess, draw_eids, progress, errors)
+
+
 class WorkerPool:
     """Manages parallel rdc daemon sessions."""
 

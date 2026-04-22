@@ -37,6 +37,7 @@ from workers import (
     collect_base, collect_pass_details, _get_draw_eids, _get_dispatch_eids,
     collect_per_draw, collect_shaders_disasm,
     collect_resource_details, collect_rt_usage,
+    collect_mesh_specs,
     _shard_list, _get_resource_tasks,
     _collect_per_draw_shard, _collect_resources_shard,
     WorkerPool,
@@ -329,6 +330,21 @@ def main() -> None:
                 write_json(json_dir / "textures.json", all_textures)
                 timings["texture_export"] = time.time() - t0
 
+            # ── Step 6.7: Mesh specs (lightweight, parallel) ──
+            print(f"\n[Step 6.7] Collecting mesh specs for {len(draw_eids)} draws ({len(active_workers)} workers) ...")
+            t0 = time.time()
+            if args.export_assets and all_meshes:
+                mesh_specs = {
+                    eid: {"eid": int(eid), "vertex_count": m.get("vertex_count", 0),
+                          "index_count": m.get("index_count", 0),
+                          "indexed": m.get("index_count", 0) > 0}
+                    for eid, m in all_meshes.items()
+                }
+            else:
+                mesh_specs = collect_mesh_specs(draw_eids, errors, active_workers=active_workers)
+            write_json(json_dir / "mesh_specs.json", mesh_specs)
+            timings["mesh_specs"] = time.time() - t0
+
             # Close worker sessions
             print("\n  Closing worker sessions ...")
             worker_pool.close_all()
@@ -378,6 +394,21 @@ def main() -> None:
                 write_json(json_dir / "textures.json", textures)
                 timings["texture_export"] = time.time() - t0
 
+            # ── Step 6.7: Mesh specs (lightweight, serial) ──
+            print(f"\n[Step 6.7] Collecting mesh specs for {len(draw_eids)} draws ...")
+            t0 = time.time()
+            if args.export_assets and meshes:
+                mesh_specs = {
+                    eid: {"eid": int(eid), "vertex_count": m.get("vertex_count", 0),
+                          "index_count": m.get("index_count", 0),
+                          "indexed": m.get("index_count", 0) > 0}
+                    for eid, m in meshes.items()
+                }
+            else:
+                mesh_specs = collect_mesh_specs(draw_eids, errors)
+            write_json(json_dir / "mesh_specs.json", mesh_specs)
+            timings["mesh_specs"] = time.time() - t0
+
         # ═══════════════════════════════════════════════════════════════
         # POST-MERGE PHASE
         # ═══════════════════════════════════════════════════════════════
@@ -423,8 +454,9 @@ def main() -> None:
         # ── Step 7.5: TSV export ──
         print("\n[Step 7.5] Exporting TSV for LLM ...")
         t0 = time.time()
+        _mesh_specs_for_tsv: dict = locals().get("mesh_specs") or {}
         export_tsv(tsv_dir, summary, pass_details, pipelines, bindings, resource_details, shader_disasm, computed,
-                   shaders_dir=out_dir / "shaders")
+                   shaders_dir=out_dir / "shaders", mesh_specs=_mesh_specs_for_tsv)
         timings["tsv_export"] = time.time() - t0
 
         # ── Step 8: Render Graph HTML ──

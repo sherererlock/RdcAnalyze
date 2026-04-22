@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from shared import (
-    guess_bpp, unwrap, fmt_number, fmt_mb, rt_bytes,
+    guess_bpp, unwrap, fmt_number, fmt_mb, rt_bytes, estimate_texture_mb,
     classify_pass_stage, detect_bloom_chain, detect_fullscreen_quad,
     detect_shader_patterns,
     analyze_spirv_instructions, estimate_register_pressure, deduplicate_shaders,
@@ -57,6 +57,7 @@ def load_analysis(analysis_dir: Path) -> dict:
         "bindings": "bindings.json",
         "collection": "_collection.json",
         "meshes": "meshes.json",
+        "mesh_specs": "mesh_specs.json",
     }
     json_dir = analysis_dir / "json"
     if not json_dir.is_dir():
@@ -505,6 +506,190 @@ def analyze_memory(data: dict) -> dict:
             {"format": fmt, "count": cnt, "size_mb": round(fmt_bytes.get(fmt, 0), 2)}
             for fmt, cnt in fmt_counts.most_common()
         ],
+    }
+
+
+def analyze_resource_specs(data: dict) -> dict:
+    resource_details = data.get("resource_details") or {}
+    pass_details = data.get("pass_details") or []
+    mesh_specs = data.get("mesh_specs") or {}
+    pipelines = data.get("pipelines") or {}
+    summary = data.get("summary") or {}
+    computed = data.get("computed") or {}
+
+    mip_by_id: dict = {}
+    for t in ((computed.get("mipmap_usage") or {}).get("per_texture") or []):
+        if isinstance(t, dict) and "id" in t:
+            mip_by_id[t["id"]] = t
+
+    textures = []
+    buffers = []
+    for rid, r in resource_details.items():
+        if not isinstance(r, dict):
+            continue
+        rtype = r.get("type", "")
+        if rtype == "Texture":
+            fmt = r.get("format", "")
+            est_mb = round(estimate_texture_mb(r), 3)
+            bpp = round(guess_bpp(fmt), 2)
+            mi = mip_by_id.get(r.get("id"))
+            textures.append({
+                "id": r.get("id", rid),
+                "name": r.get("name", ""),
+                "format": fmt,
+                "width": r.get("width", 0),
+                "height": r.get("height", 0),
+                "depth": r.get("depth", 1),
+                "array_size": r.get("array_size", 1),
+                "mips": r.get("mips", 1),
+                "bpp": bpp,
+                "est_mb": est_mb,
+                "viewed_mip_range": (mi or {}).get("viewed_mip_range", ""),
+                "unviewed_mips": (mi or {}).get("unviewed_mips", ""),
+                "byte_size": r.get("byte_size", 0),
+                "creation_flags": r.get("creation_flags", ""),
+            })
+        elif rtype == "Buffer":
+            flags = str(r.get("creation_flags") or "")
+            _usage_keywords = [
+                ("Vertex", "vertex"), ("Index", "index"),
+                ("Uniform", "uniform"), ("Storage", "storage"),
+                ("Constant", "uniform"), ("Structured", "storage"),
+            ]
+            usage = next((tag for kw, tag in _usage_keywords if kw.lower() in flags.lower()), "")
+            buffers.append({
+                "id": r.get("id", rid),
+                "name": r.get("name", ""),
+                "length": r.get("length", 0),
+                "byte_size": r.get("byte_size", 0),
+                "creation_flags": flags,
+                "usage": usage,
+            })
+
+    textures.sort(key=lambda x: -(x["est_mb"]))
+    buffers.sort(key=lambda x: -(x.get("byte_size") or 0))
+
+    def _parse_ops(ops_list, role: str) -> str:
+        if not ops_list:
+            return ""
+        if isinstance(ops_list, dict):
+            return str(ops_list.get(role, ""))
+        for entry in ops_list:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                if str(entry[0]).upper() == role.upper():
+                    return str(entry[1])
+        return ""
+
+    # Collect per-pass RT rows, then deduplicate by resource id+format+size
+    _rt_raw: list[dict] = []
+    for p in pass_details:
+        if not isinstance(p, dict):
+            continue
+        pass_name = p.get("name", "")
+        load_ops = p.get("load_ops") or []
+        store_ops = p.get("store_ops") or []
+        for i, ct in enumerate(p.get("color_targets") or []):
+            if not isinstance(ct, dict):
+                continue
+            _rt_raw.append({
+                "pass": pass_name,
+                "role": f"Color{i}",
+                "name": ct.get("name", ""),
+                "id": ct.get("id", ""),
+                "format": ct.get("format", ""),
+                "width": ct.get("width", 0),
+                "height": ct.get("height", 0),
+                "samples": ct.get("samples", 1),
+                "bpp": round(guess_bpp(ct.get("format", "")), 2),
+                "tile_mb": round(rt_bytes(ct) / (1024 * 1024), 3),
+                "load_op": _parse_ops(load_ops, str(i)),
+                "store_op": _parse_ops(store_ops, str(i)),
+            })
+        dt = p.get("depth_target")
+        if isinstance(dt, dict):
+            _rt_raw.append({
+                "pass": pass_name,
+                "role": "Depth",
+                "name": dt.get("name", ""),
+                "id": dt.get("id", ""),
+                "format": dt.get("format", ""),
+                "width": dt.get("width", 0),
+                "height": dt.get("height", 0),
+                "samples": dt.get("samples", 1),
+                "bpp": round(guess_bpp(dt.get("format", "")), 2),
+                "tile_mb": round(rt_bytes(dt) / (1024 * 1024), 3),
+                "load_op": _parse_ops(load_ops, "D"),
+                "store_op": _parse_ops(store_ops, "D"),
+            })
+
+    # Deduplicate: group by (id or name+format+size), aggregate pass count
+    _rt_by_key: dict = {}
+    for row in _rt_raw:
+        key = (row.get("id") or f'{row["name"]}|{row["format"]}|{row["width"]}|{row["height"]}')
+        if key not in _rt_by_key:
+            _rt_by_key[key] = dict(row)
+            _rt_by_key[key]["pass_count"] = 1
+            _rt_by_key[key]["pass_names"] = [row["pass"]]
+        else:
+            _rt_by_key[key]["pass_count"] += 1
+            if row["pass"] not in _rt_by_key[key]["pass_names"]:
+                _rt_by_key[key]["pass_names"].append(row["pass"])
+            # Take the most informative load/store op seen
+            if not _rt_by_key[key]["load_op"] and row["load_op"]:
+                _rt_by_key[key]["load_op"] = row["load_op"]
+            if not _rt_by_key[key]["store_op"] and row["store_op"]:
+                _rt_by_key[key]["store_op"] = row["store_op"]
+    render_targets = sorted(_rt_by_key.values(), key=lambda x: -(x["tile_mb"]))
+
+    draws_list = unwrap(summary.get("draws"), "draws") or []
+    draw_by_eid: dict = {d["eid"]: d for d in draws_list if isinstance(d, dict) and "eid" in d}
+    meshes = []
+    for eid_str, m in mesh_specs.items():
+        if not isinstance(m, dict):
+            continue
+        eid = m.get("eid", 0)
+        d = draw_by_eid.get(eid, {})
+        vc = m.get("vertex_count", 0)
+        ic = m.get("index_count", 0)
+        pipe = pipelines.get(eid_str) or {}
+        meshes.append({
+            "eid": eid,
+            "pass": d.get("pass", ""),
+            "marker": d.get("marker", ""),
+            "topology": pipe.get("topology", ""),
+            "vertex_count": vc,
+            "index_count": ic,
+            "triangles": d.get("triangles", 0),
+            "instances": d.get("instances", 0),
+            "indexed": ic > 0,
+            "reuse_ratio": round(ic / vc, 2) if vc > 0 and ic > 0 else 0.0,
+        })
+    meshes.sort(key=lambda x: -x["vertex_count"])
+
+    total_texture_mb = sum(t["est_mb"] for t in textures)
+    total_buffer_mb = sum((b.get("byte_size") or 0) for b in buffers) / (1024 * 1024)
+    total_rt_mb = sum(rt.get("tile_mb", 0) for rt in render_targets)
+    total_rt_passes = sum(rt.get("pass_count", 1) for rt in render_targets)
+
+    return {
+        "summary": {
+            "texture_count": len(textures),
+            "buffer_count": len(buffers),
+            "rt_count": len(render_targets),
+            "rt_pass_uses": total_rt_passes,
+            "draw_mesh_count": len(meshes),
+            "total_texture_mb": round(total_texture_mb, 2),
+            "total_buffer_mb": round(total_buffer_mb, 2),
+            "total_rt_mb": round(total_rt_mb, 2),
+            "total_vertices": sum(m["vertex_count"] for m in meshes),
+            "total_triangles": sum(m["triangles"] for m in meshes),
+        },
+        "textures": textures,
+        "buffers": buffers,
+        "render_targets": render_targets,
+        "meshes": meshes,
+        "top_textures": textures[:25],
+        "top_meshes": meshes[:25],
     }
 
 
@@ -1014,6 +1199,7 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     suggestions = analysis["suggestions"]
     overdraw_data = analysis.get("overdraw") or {}
     mipmap_data = analysis.get("mipmap_usage") or {}
+    resource_specs = analysis.get("resource_specs") or {}
 
     # ── Build HTML sections ──
 
@@ -1536,6 +1722,31 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
             f'<td class="num">{fd["size_mb"]:.2f} MB</td></tr>'
         )
 
+    # Per-texture spec sub-table (top 30 by est_mb)
+    _tex_spec_rows = []
+    _rs_sum = resource_specs.get("summary") or {}
+    for t in (resource_specs.get("textures") or [])[:30]:
+        w, h = t.get("width", 0), t.get("height", 0)
+        d = t.get("depth", 1) or 1
+        arr = t.get("array_size", 1) or 1
+        dim_parts = [f"{w}×{h}"]
+        if d > 1:
+            dim_parts.append(f"d{d}")
+        if arr > 1:
+            dim_parts.append(f"[{arr}]")
+        dim_str = " ".join(dim_parts)
+        tname = t.get("name", "")
+        if len(tname) > 50:
+            tname = tname[:47] + "..."
+        _tex_spec_rows.append(
+            f'<tr><td title="{_esc(t.get("name",""))}">{_esc(tname)}</td>'
+            f'<td>{_esc(t.get("format",""))}</td>'
+            f'<td class="num">{_esc(dim_str)}</td>'
+            f'<td class="num">{t.get("mips","")}</td>'
+            f'<td class="num">{t.get("bpp","")}</td>'
+            f'<td class="num">{t.get("est_mb",0):.3f}</td></tr>'
+        )
+
     memory_html = f"""
     <div class="cards-grid mini">
       <div class="card">
@@ -1561,6 +1772,13 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
         </table>
         </div>
       </div>
+    </div>
+    <h4>Per-Texture Specifications (top {len(_tex_spec_rows)} by size)</h4>
+    <div class="table-wrap">
+    <table class="data-table sortable compact">
+      <thead><tr><th>Name</th><th>Format</th><th>Dim</th><th>Mips</th><th>BPP</th><th>Est MB</th></tr></thead>
+      <tbody>{"".join(_tex_spec_rows)}</tbody>
+    </table>
     </div>
     """
 
@@ -1809,7 +2027,204 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     </div>
     """
 
-    # Section 11: Suggestions
+    # Section 12: Resource Specifications
+    rs_sum = resource_specs.get("summary") or {}
+    rs_textures = resource_specs.get("textures") or []
+    rs_buffers = resource_specs.get("buffers") or []
+    rs_rts = resource_specs.get("render_targets") or []
+    rs_meshes = resource_specs.get("meshes") or []
+    rs_top_textures = resource_specs.get("top_textures") or []
+    rs_top_meshes = resource_specs.get("top_meshes") or []
+
+    # Summary cards
+    rs_cards = f"""
+    <div class="cards-grid mini">
+      <div class="card">
+        <div class="card-label">Textures</div>
+        <div class="card-value">{rs_sum.get("texture_count", 0)}</div>
+        <div class="card-sub">{_fmt_mb(rs_sum.get("total_texture_mb", 0))}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Buffers</div>
+        <div class="card-value">{rs_sum.get("buffer_count", 0)}</div>
+        <div class="card-sub">{_fmt_mb(rs_sum.get("total_buffer_mb", 0))}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Render Targets</div>
+        <div class="card-value">{rs_sum.get("rt_count", 0)}</div>
+        <div class="card-sub">unique · {rs_sum.get("rt_pass_uses", 0)} pass uses · {_fmt_mb(rs_sum.get("total_rt_mb", 0))}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Mesh Draws</div>
+        <div class="card-value">{rs_sum.get("draw_mesh_count", 0)}</div>
+        <div class="card-sub">{_fmt_number(rs_sum.get("total_vertices", 0))} verts</div>
+      </div>
+    </div>"""
+
+    # Top textures bar chart
+    _rs_tex_max = max((t["est_mb"] for t in rs_top_textures), default=1) or 1
+    _rs_tex_bars = []
+    for t in rs_top_textures:
+        pct = t["est_mb"] / _rs_tex_max * 100
+        ratio = t["est_mb"] / _rs_tex_max
+        tname = t.get("name", "")
+        if len(tname) > 40:
+            tname = tname[:37] + "..."
+        fmt_label = t.get("format", "")
+        w, h = t.get("width", 0), t.get("height", 0)
+        _rs_tex_bars.append(
+            f'<div class="bar-row">'
+            f'<div class="bar-label" title="{_esc(t.get("name",""))}">{_esc(tname)}'
+            f'<span class="bar-sub">{_esc(fmt_label)} {w}×{h}</span></div>'
+            f'<div class="bar-track">'
+            f'<div class="bar-fill" style="width:{pct:.1f}%;background:{_bar_color(ratio)}"></div></div>'
+            f'<div class="bar-value">{t["est_mb"]:.2f} MB</div>'
+            f'</div>'
+        )
+
+    # Top meshes bar chart
+    _rs_mesh_max = max((m["vertex_count"] for m in rs_top_meshes), default=1) or 1
+    _rs_mesh_bars = []
+    for m in rs_top_meshes:
+        pct = m["vertex_count"] / _rs_mesh_max * 100
+        ratio = m["vertex_count"] / _rs_mesh_max
+        mname = m.get("marker", "") or m.get("pass", "") or f"EID {m['eid']}"
+        if len(mname) > 40:
+            mname = mname[:37] + "..."
+        _rs_mesh_bars.append(
+            f'<div class="bar-row">'
+            f'<div class="bar-label" title="EID {m["eid"]}">{_esc(mname)}'
+            f'<span class="bar-sub">EID {m["eid"]} · {m.get("topology","")}</span></div>'
+            f'<div class="bar-track">'
+            f'<div class="bar-fill" style="width:{pct:.1f}%;background:{_bar_color(ratio)}"></div></div>'
+            f'<div class="bar-value">{_fmt_number(m["vertex_count"])} v</div>'
+            f'</div>'
+        )
+
+    # Texture table
+    _rs_tex_table_rows = []
+    for t in rs_textures:
+        w, h = t.get("width", 0), t.get("height", 0)
+        d = t.get("depth", 1) or 1
+        arr = t.get("array_size", 1) or 1
+        dim_parts = [f"{w}×{h}"]
+        if d > 1:
+            dim_parts.append(f"d{d}")
+        if arr > 1:
+            dim_parts.append(f"[{arr}]")
+        tname = t.get("name", "")
+        if len(tname) > 50:
+            tname = tname[:47] + "..."
+        _rs_tex_table_rows.append(
+            f'<tr><td title="{_esc(t.get("name",""))}">{_esc(tname)}</td>'
+            f'<td>{_esc(t.get("format",""))}</td>'
+            f'<td class="num">{" ".join(dim_parts)}</td>'
+            f'<td class="num">{t.get("mips","")}</td>'
+            f'<td class="num">{t.get("bpp","")}</td>'
+            f'<td class="num">{t.get("est_mb",0):.3f}</td>'
+            f'<td>{_esc(str(t.get("viewed_mip_range","")))}</td></tr>'
+        )
+
+    # Mesh table
+    _rs_mesh_table_rows = []
+    for m in rs_meshes:
+        mname = m.get("marker", "") or ""
+        if len(mname) > 40:
+            mname = mname[:37] + "..."
+        _rs_mesh_table_rows.append(
+            f'<tr><td class="num">{m["eid"]}</td>'
+            f'<td>{_esc(m.get("pass",""))}</td>'
+            f'<td title="{_esc(m.get("marker",""))}">{_esc(mname)}</td>'
+            f'<td>{_esc(m.get("topology",""))}</td>'
+            f'<td class="num">{_fmt_number(m["vertex_count"])}</td>'
+            f'<td class="num">{_fmt_number(m["index_count"])}</td>'
+            f'<td class="num">{_fmt_number(m["triangles"])}</td>'
+            f'<td class="num">{m.get("reuse_ratio",0):.2f}</td>'
+            f'<td class="num">{m.get("instances",1)}</td></tr>'
+        )
+
+    # Buffer table
+    _rs_buf_table_rows = []
+    for b in rs_buffers:
+        bsz = (b.get("byte_size") or 0) / (1024 * 1024)
+        bname = b.get("name", "")
+        if len(bname) > 50:
+            bname = bname[:47] + "..."
+        _rs_buf_table_rows.append(
+            f'<tr><td title="{_esc(b.get("name",""))}">{_esc(bname)}</td>'
+            f'<td class="num">{b.get("length","")}</td>'
+            f'<td class="num">{bsz:.3f} MB</td>'
+            f'<td>{_esc(b.get("creation_flags",""))}</td>'
+            f'<td>{_esc(b.get("usage",""))}</td></tr>'
+        )
+
+    # RenderTarget table (deduplicated by resource)
+    _rs_rt_table_rows = []
+    for rt in rs_rts:
+        rname = rt.get("name", "")
+        if len(rname) > 50:
+            rname = rname[:47] + "..."
+        pass_count = rt.get("pass_count", 1)
+        pass_names = rt.get("pass_names") or [rt.get("pass", "")]
+        # Show first 2 pass names, then "..." if more
+        passes_preview = ", ".join(pass_names[:2])
+        if len(pass_names) > 2:
+            passes_preview += f" +{len(pass_names)-2}"
+        _rs_rt_table_rows.append(
+            f'<tr><td title="{_esc(rname)}">{_esc(rname)}</td>'
+            f'<td>{_esc(rt.get("role",""))}</td>'
+            f'<td>{_esc(rt.get("format",""))}</td>'
+            f'<td class="num">{rt.get("width",0)}×{rt.get("height",0)}</td>'
+            f'<td class="num">{rt.get("samples",1)}</td>'
+            f'<td class="num">{rt.get("tile_mb",0):.3f}</td>'
+            f'<td>{_esc(str(rt.get("load_op","")))}</td>'
+            f'<td>{_esc(str(rt.get("store_op","")))}</td>'
+            f'<td class="num" title="{_esc(", ".join(pass_names))}">{pass_count}</td></tr>'
+        )
+
+    resource_specs_html = f"""
+    {rs_cards}
+    <div class="two-col">
+      <div>
+        <h4>Largest Textures (top {len(rs_top_textures)})</h4>
+        <div class="bar-chart">{"".join(_rs_tex_bars) or "<p class=text-muted>No texture data.</p>"}</div>
+      </div>
+      <div>
+        <h4>Heaviest Mesh Draws by Vertex Count (top {len(rs_top_meshes)})</h4>
+        <div class="bar-chart">{"".join(_rs_mesh_bars) or "<p class=text-muted>No mesh spec data — re-run collect.py.</p>"}</div>
+      </div>
+    </div>
+    <h4>Textures ({len(rs_textures)})</h4>
+    <div class="table-wrap">
+    <table class="data-table sortable compact">
+      <thead><tr><th>Name</th><th>Format</th><th>Dim</th><th>Mips</th><th>BPP</th><th>Est MB</th><th>Viewed Range</th></tr></thead>
+      <tbody>{"".join(_rs_tex_table_rows) or "<tr><td colspan=7 class=text-muted>No texture data.</td></tr>"}</tbody>
+    </table>
+    </div>
+    <h4>Meshes / Draw Calls ({len(rs_meshes)})</h4>
+    <div class="table-wrap">
+    <table class="data-table sortable compact">
+      <thead><tr><th>EID</th><th>Pass</th><th>Marker</th><th>Topology</th><th>Verts</th><th>Indices</th><th>Tris</th><th>Reuse</th><th>Inst</th></tr></thead>
+      <tbody>{"".join(_rs_mesh_table_rows) or "<tr><td colspan=9 class=text-muted>No mesh spec data — re-run collect.py.</td></tr>"}</tbody>
+    </table>
+    </div>
+    <h4>Buffers ({len(rs_buffers)})</h4>
+    <div class="table-wrap">
+    <table class="data-table sortable compact">
+      <thead><tr><th>Name</th><th>Length</th><th>Size</th><th>Flags</th><th>Usage</th></tr></thead>
+      <tbody>{"".join(_rs_buf_table_rows) or "<tr><td colspan=5 class=text-muted>No buffer data.</td></tr>"}</tbody>
+    </table>
+    </div>
+    <h4>Render Targets ({len(rs_rts)} unique)</h4>
+    <div class="table-wrap">
+    <table class="data-table sortable compact">
+      <thead><tr><th>Name</th><th>Role</th><th>Format</th><th>Size</th><th>Samples</th><th>Tile MB</th><th>Load</th><th>Store</th><th title="Number of passes using this RT">Passes</th></tr></thead>
+      <tbody>{"".join(_rs_rt_table_rows) or "<tr><td colspan=9 class=text-muted>No RT data.</td></tr>"}</tbody>
+    </table>
+    </div>
+    """
+
+    # Section 13: Suggestions
     suggestion_cards = []
     for s in suggestions:
         suggestion_cards.append(
@@ -2492,9 +2907,18 @@ h4 {{
     <div class="section-body">{vertex_html}</div>
   </div>
 
+  <div class="section" id="sec-resource-specs">
+    <div class="section-header" onclick="toggleSection('sec-resource-specs')">
+      <span class="section-num">12</span>
+      <h2>Resource Specifications</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="section-body">{resource_specs_html}</div>
+  </div>
+
   <div class="section" id="sec-suggestions">
     <div class="section-header" onclick="toggleSection('sec-suggestions')">
-      <span class="section-num">12</span>
+      <span class="section-num">13</span>
       <h2>Optimization Suggestions</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -2579,6 +3003,7 @@ def main():
         "mipmap_usage": analyze_mipmap_usage(data),
         "tbdr": analyze_tbdr(data),
         "vertex_efficiency": analyze_vertex_efficiency(data),
+        "resource_specs": analyze_resource_specs(data),
     }
     analysis["suggestions"] = generate_suggestions(analysis, data)
 
