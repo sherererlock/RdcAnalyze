@@ -16,6 +16,77 @@ ALERT_LARGE_TEX_DIM = 2048
 ALERT_LARGE_TEX_MB = 4.0
 
 
+def compute_overdraw(summary: dict, pass_details: list) -> dict:
+    """Estimate per-pass overdraw from PS Invocations / RT pixel count."""
+    counters = summary.get("counters") or {}
+    raw = counters.get("rows") or (counters if isinstance(counters, list) else [])
+
+    ps_inv_by_eid: dict[int, int] = {}
+    for r in raw:
+        if isinstance(r, dict) and r.get("counter") == "PS Invocations":
+            eid = r.get("eid")
+            if eid is not None:
+                ps_inv_by_eid[int(eid)] = int(r.get("value", 0) or 0)
+
+    if not ps_inv_by_eid:
+        return {"available": False, "reason": "PS Invocations counter not exposed"}
+
+    per_pass = []
+    total_ps_inv = 0
+    total_rt_pixels = 0
+    worst_od = 0.0
+    worst_pass = ""
+
+    for p in pass_details:
+        if not isinstance(p, dict):
+            continue
+        name = p.get("name", "")
+        begin_eid = p.get("begin_eid", 0)
+        end_eid = p.get("end_eid", 0)
+
+        cts = p.get("color_targets") or []
+        rt_w = cts[0].get("width", 0) if cts else 0
+        rt_h = cts[0].get("height", 0) if cts else 0
+        if not cts:
+            dt = p.get("depth_target")
+            if isinstance(dt, dict):
+                rt_w = dt.get("width", 0)
+                rt_h = dt.get("height", 0)
+        rt_pixels = rt_w * rt_h
+
+        ps_inv = sum(v for eid, v in ps_inv_by_eid.items() if begin_eid <= eid <= end_eid)
+
+        if rt_pixels == 0 or ps_inv == 0:
+            continue
+
+        overdraw = round(ps_inv / rt_pixels, 2)
+        severity = "high" if overdraw > 4 else "warn" if overdraw > 2 else "ok"
+
+        per_pass.append({
+            "pass": name,
+            "eid_range": [begin_eid, end_eid],
+            "rt_size": f"{rt_w}x{rt_h}",
+            "rt_pixels": rt_pixels,
+            "ps_invocations": ps_inv,
+            "overdraw": overdraw,
+            "severity": severity,
+        })
+
+        total_ps_inv += ps_inv
+        total_rt_pixels += rt_pixels
+        if overdraw > worst_od:
+            worst_od = overdraw
+            worst_pass = name
+
+    frame_avg = round(total_ps_inv / total_rt_pixels, 2) if total_rt_pixels > 0 else 0.0
+    return {
+        "available": True,
+        "per_pass": per_pass,
+        "frame_avg_overdraw": frame_avg,
+        "worst_pass": worst_pass,
+    }
+
+
 def compute_analysis(
     summary: dict,
     pass_details: list,
@@ -127,6 +198,10 @@ def compute_analysis(
                         "eid": entry.get("eid"),
                     })
     result["alerts"] = alerts
+
+    # ── Overdraw estimation ──
+    result["overdraw"] = compute_overdraw(summary, pass_details)
+
     return result
 
 

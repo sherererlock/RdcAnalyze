@@ -90,6 +90,5 @@ rdc-portable\rdc.bat close
 
 - **Single RenderDoc call at a time**: Never invoke multiple rdc commands concurrently against the same session — RenderDoc will deadlock. Parallel collection uses separate named sessions.
 - **Embedded Python is the runtime**: Always use `python\python.exe`, not system Python. The embedded interpreter has all dependencies (click, numpy, protobuf, etc.) pre-installed in `python\Lib\site-packages\`.
-- **`python/` and `rdc-portable/` are read-only**: These directories contain checked-in binaries and installed packages. Edit only files under `Scripts/rdc/`.
 - **.rdc files are gitignored**: Capture files are large binaries excluded via `.gitignore`.
 - **AI 分析帧数据时必须从 `tsv/` 目录读取**：TSV 格式专为 LLM 设计，省 token、易解析。禁止直接读 `json/` 目录的 JSON 文件做分析——JSON 仅供脚本内部使用。

@@ -206,6 +206,26 @@ def _build_pass_rw(summary: dict) -> tuple[list[str], list[list]]:
     return headers, rows
 
 
+def _build_overdraw(computed: dict) -> tuple[list[str], list[list]]:
+    od = (computed or {}).get("overdraw") or {}
+    if not od.get("available"):
+        return [], []
+    headers = ["pass", "eid_range", "rt_size", "rt_pixels", "ps_invocations", "overdraw", "severity"]
+    rows = []
+    for p in od.get("per_pass") or []:
+        eids = p.get("eid_range") or [0, 0]
+        rows.append([
+            p.get("pass", ""),
+            f"{eids[0]}-{eids[1]}",
+            p.get("rt_size", ""),
+            p.get("rt_pixels", 0),
+            p.get("ps_invocations", 0),
+            p.get("overdraw", 0.0),
+            p.get("severity", ""),
+        ])
+    return headers, rows
+
+
 def _build_alerts(computed: dict) -> tuple[list[str], list[list]]:
     alerts = computed.get("alerts") or []
     if not alerts:
@@ -504,6 +524,10 @@ def export_tsv(
         "pass_rw": _build_pass_rw(summary),
         "alerts": _build_alerts(computed or {}),
     }
+
+    odh, odr = _build_overdraw(computed or {})
+    if odh:
+        tables["overdraw"] = (odh, odr)
 
     counters_by_eid = _build_counters_by_eid(summary)
     sh, sr, sumh, sumr = _build_pipeline_stages(summary, pass_details, counters_by_eid)

@@ -472,6 +472,15 @@ def analyze_memory(data: dict) -> dict:
     }
 
 
+def analyze_overdraw(data: dict) -> dict:
+    """Return overdraw estimation from computed.json, or unavailable sentinel."""
+    computed = data.get("computed") or {}
+    od = computed.get("overdraw")
+    if od:
+        return od
+    return {"available": False, "reason": "No overdraw data — re-run collect.py to generate computed.json"}
+
+
 def analyze_pipeline_stages(data: dict) -> dict:
     """Classify each pass into a pipeline stage using metadata heuristics."""
     summary = data.get("summary") or {}
@@ -878,6 +887,7 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     shaders = analysis["shaders"]
     memory = analysis["memory"]
     suggestions = analysis["suggestions"]
+    overdraw_data = analysis.get("overdraw") or {}
 
     # ── Build HTML sections ──
 
@@ -1428,7 +1438,75 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     </div>
     """
 
-    # Section 7: Suggestions
+    # Section 8: Overdraw Estimation
+    if overdraw_data.get("available"):
+        od_per_pass = overdraw_data.get("per_pass") or []
+        od_frame_avg = overdraw_data.get("frame_avg_overdraw", 0.0)
+        od_worst = overdraw_data.get("worst_pass", "")
+        od_max = max((p["overdraw"] for p in od_per_pass), default=1.0)
+
+        od_bars = []
+        for p in od_per_pass:
+            od = p["overdraw"]
+            pct = od / max(od_max, 0.01) * 100
+            color = "#ef4444" if od >= 4 else "#f97316" if od >= 2 else "#22c55e"
+            od_bars.append(
+                f'<div class="bar-row">'
+                f'<div class="bar-label">{_esc(p["pass"])}'
+                f'<span class="bar-sub">{_esc(p["rt_size"])}</span></div>'
+                f'<div class="bar-track">'
+                f'<div class="bar-fill" style="width:{pct:.1f}%;background:{color}"></div></div>'
+                f'<div class="bar-value" style="color:{color}">{od:.2f}x</div>'
+                f'</div>'
+            )
+
+        od_table_rows = []
+        for p in od_per_pass:
+            od = p["overdraw"]
+            sev = p.get("severity", "ok")
+            sev_color = "#ef4444" if sev == "high" else "#f97316" if sev == "warn" else "#22c55e"
+            od_table_rows.append(
+                f'<tr>'
+                f'<td>{_esc(p["pass"])}</td>'
+                f'<td class="num">{p["eid_range"][0]}-{p["eid_range"][1]}</td>'
+                f'<td class="num">{_esc(p["rt_size"])}</td>'
+                f'<td class="num">{_fmt_number(p["ps_invocations"])}</td>'
+                f'<td class="num" style="color:{sev_color};font-weight:600">{od:.2f}x</td>'
+                f'<td><span style="color:{sev_color}">{_esc(sev)}</span></td>'
+                f'</tr>'
+            )
+
+        overdraw_html = f"""
+    <div class="mini-cards">
+      <div class="mini-card">
+        <div class="mini-label">Frame Avg Overdraw</div>
+        <div class="mini-value">{od_frame_avg:.2f}x</div>
+      </div>
+      <div class="mini-card">
+        <div class="mini-label">Worst Pass</div>
+        <div class="mini-value small">{_esc(od_worst)}</div>
+      </div>
+      <div class="mini-card">
+        <div class="mini-label">Passes Analyzed</div>
+        <div class="mini-value">{len(od_per_pass)}</div>
+      </div>
+    </div>
+    <h4>Overdraw per Pass <span style="font-size:11px;color:var(--text-muted);font-weight:400">(red ≥4x &nbsp; orange ≥2x &nbsp; green &lt;2x)</span></h4>
+    <div class="chart-area">{"".join(od_bars)}</div>
+    <div class="table-wrap">
+    <table class="data-table sortable">
+      <thead><tr>
+        <th>Pass</th><th>EID Range</th><th>RT Size</th><th>PS Invocations</th><th>Overdraw</th><th>Severity</th>
+      </tr></thead>
+      <tbody>{"".join(od_table_rows)}</tbody>
+    </table>
+    </div>
+    """
+    else:
+        od_reason = overdraw_data.get("reason", "No overdraw data available")
+        overdraw_html = f'<p class="text-muted">{_esc(od_reason)}</p>'
+
+    # Section 9: Suggestions
     suggestion_cards = []
     for s in suggestions:
         suggestion_cards.append(
@@ -2075,9 +2153,18 @@ h4 {{
     <div class="section-body">{memory_html}</div>
   </div>
 
+  <div class="section" id="sec-overdraw">
+    <div class="section-header" onclick="toggleSection('sec-overdraw')">
+      <span class="section-num">08</span>
+      <h2>Overdraw Estimation</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="section-body">{overdraw_html}</div>
+  </div>
+
   <div class="section" id="sec-suggestions">
     <div class="section-header" onclick="toggleSection('sec-suggestions')">
-      <span class="section-num">08</span>
+      <span class="section-num">09</span>
       <h2>Optimization Suggestions</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -2158,6 +2245,7 @@ def main():
         "bandwidth": analyze_bandwidth(data),
         "shaders": analyze_shaders(data),
         "memory": analyze_memory(data),
+        "overdraw": analyze_overdraw(data),
     }
     analysis["suggestions"] = generate_suggestions(analysis, data)
 
