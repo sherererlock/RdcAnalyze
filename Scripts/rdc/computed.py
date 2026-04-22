@@ -8,7 +8,7 @@ import json
 from collections import Counter, defaultdict
 
 from rpc import _unwrap
-from shared import estimate_texture_mb
+from shared import estimate_texture_mb, guess_bpp
 
 # Alert thresholds
 ALERT_HIGH_TRI_DRAW = 10000
@@ -162,6 +162,117 @@ def compute_mipmap_usage(binding_views: dict, resource_details: dict) -> dict:
     }
 
 
+def compute_tbdr(pass_details: list) -> dict:
+    """Detect unnecessary TBDR tile load/store operations.
+
+    Returns per-attachment analysis with load/store ops, tile bandwidth cost,
+    and whether the op is unnecessary (no prior writer or no subsequent reader).
+    Vulkan-only: returns available=False when load_ops/store_ops are absent.
+    """
+    has_data = any(p.get("load_ops") or p.get("store_ops") for p in pass_details if isinstance(p, dict))
+    if not has_data:
+        return {"available": False, "reason": "No load/store op data (GLES capture or Vulkan without subpass info)"}
+
+    def _get_attachments(p):
+        load_map = {op[0]: op[1] for op in (p.get("load_ops") or []) if len(op) >= 2}
+        store_map = {op[0]: op[1] for op in (p.get("store_ops") or []) if len(op) >= 2}
+        result = []
+        for ct in (p.get("color_targets") or []):
+            rid = ct.get("id")
+            if rid is None:
+                continue
+            result.append((
+                rid, ct.get("name", ""), ct.get("format", ""),
+                ct.get("width", 0), ct.get("height", 0),
+                load_map.get("C", "DontCare"), store_map.get("C", "DontCare"), "Color",
+            ))
+        dt = p.get("depth_target")
+        if isinstance(dt, dict):
+            rid = dt.get("id")
+            if rid is not None:
+                load_op = load_map.get("DS") or load_map.get("D") or "DontCare"
+                store_op = store_map.get("DS") or store_map.get("D") or "DontCare"
+                result.append((
+                    rid, dt.get("name", ""), dt.get("format", ""),
+                    dt.get("width", 0), dt.get("height", 0),
+                    load_op, store_op, "Depth",
+                ))
+        return result
+
+    # Build cross-pass store/load maps: rid -> sorted list of pass indices
+    stores_at: dict[int, list[int]] = defaultdict(list)
+    loads_at: dict[int, list[int]] = defaultdict(list)
+    pass_attachments: list[list] = []
+    for idx, p in enumerate(pass_details):
+        if not isinstance(p, dict):
+            pass_attachments.append([])
+            continue
+        atts = _get_attachments(p)
+        pass_attachments.append(atts)
+        for (rid, *_, load_op, store_op, _att_type) in atts:
+            if load_op == "Load":
+                loads_at[rid].append(idx)
+            if store_op == "Store":
+                stores_at[rid].append(idx)
+
+    per_attachment = []
+    total_wasted_mb = 0.0
+    worst_mb = 0.0
+    worst_pass = ""
+
+    for idx, p in enumerate(pass_details):
+        if not isinstance(p, dict):
+            continue
+        pass_name = p.get("name", "")
+        for (rid, att_name, fmt, w, h, load_op, store_op, att_type) in pass_attachments[idx]:
+            bpp = guess_bpp(fmt)
+            tile_mb = w * h * (bpp / 8) / (1024 * 1024)
+
+            issue = None
+            recommendation = ""
+            # Unnecessary load: loads from DRAM but no prior pass stored to this RT
+            if load_op == "Load":
+                prior_stores = [j for j in stores_at.get(rid, []) if j < idx]
+                if not prior_stores:
+                    issue = "unnecessary_load"
+                    recommendation = "Change loadOp to Clear or DontCare — no prior pass writes this RT"
+            # Unnecessary store: stores to DRAM but no subsequent pass loads from this RT
+            if store_op == "Store" and issue is None:
+                later_loads = [j for j in loads_at.get(rid, []) if j > idx]
+                if not later_loads:
+                    issue = "unnecessary_store"
+                    recommendation = "Change storeOp to DontCare — no subsequent pass reads this RT (transient)"
+
+            wasted = tile_mb if issue else 0.0
+            total_wasted_mb += wasted
+            if wasted > worst_mb:
+                worst_mb = wasted
+                worst_pass = pass_name
+
+            per_attachment.append({
+                "pass": pass_name,
+                "pass_idx": idx,
+                "attachment": att_name,
+                "attachment_type": att_type,
+                "format": fmt,
+                "rt_size": f"{w}x{h}",
+                "tile_mb": round(tile_mb, 3),
+                "load_op": load_op,
+                "store_op": store_op,
+                "issue": issue,
+                "recommendation": recommendation,
+            })
+
+    issues_only = [a for a in per_attachment if a["issue"]]
+    return {
+        "available": True,
+        "per_attachment": per_attachment,
+        "issues": issues_only,
+        "total_wasted_mb": round(total_wasted_mb, 3),
+        "worst_pass": worst_pass,
+    }
+
+
 def compute_analysis(
     summary: dict,
     pass_details: list,
@@ -280,6 +391,9 @@ def compute_analysis(
 
     # ── Mipmap usage (view-level waste) ──
     result["mipmap_usage"] = compute_mipmap_usage(binding_views or {}, resource_details)
+
+    # ── TBDR tile load/store efficiency ──
+    result["tbdr"] = compute_tbdr(pass_details)
 
     return result
 

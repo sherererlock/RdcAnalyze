@@ -490,6 +490,15 @@ def analyze_mipmap_usage(data: dict) -> dict:
     return {"per_texture": [], "total_wasted_mb": 0.0}
 
 
+def analyze_tbdr(data: dict) -> dict:
+    """Return TBDR tile load/store efficiency analysis from computed.json."""
+    computed = data.get("computed") or {}
+    tbdr = computed.get("tbdr")
+    if tbdr is not None:
+        return tbdr
+    return {"available": False, "reason": "No TBDR data — re-run collect.py to generate computed.json"}
+
+
 def analyze_pipeline_stages(data: dict) -> dict:
     """Classify each pass into a pipeline stage using metadata heuristics."""
     summary = data.get("summary") or {}
@@ -753,20 +762,41 @@ def generate_suggestions(analysis: dict, data: dict) -> list[dict]:
                 "category": "Geometry",
             })
 
-    # 6. No load/store ops
-    pass_details = data.get("pass_details") or []
-    has_load_store = any(p.get("load_ops") or p.get("store_ops") for p in pass_details)
-    if not has_load_store and len(pass_details) > 0:
-        suggestions.append({
-            "severity": "info",
-            "title": "No load/store ops data (GLES limitation)",
-            "detail": (
-                "This capture doesn't contain load/store operation data. "
-                "TBDR optimization analysis (tile-based load/store efficiency) "
-                "is not available. Bandwidth estimates assume worst-case full load+store."
-            ),
-            "category": "Data",
-        })
+    # 6. TBDR load/store efficiency
+    tbdr = (computed or {}).get("tbdr") or {}
+    if not tbdr.get("available"):
+        pass_details_sg = data.get("pass_details") or []
+        if len(pass_details_sg) > 0:
+            suggestions.append({
+                "severity": "info",
+                "title": "No load/store ops data (GLES limitation)",
+                "detail": (
+                    "This capture doesn't contain load/store operation data. "
+                    "TBDR optimization analysis (tile-based load/store efficiency) "
+                    "is not available. Bandwidth estimates assume worst-case full load+store."
+                ),
+                "category": "Data",
+            })
+    else:
+        tbdr_wasted = tbdr.get("total_wasted_mb", 0.0)
+        tbdr_issues = tbdr.get("issues") or []
+        unload = [a for a in tbdr_issues if a.get("issue") == "unnecessary_load"]
+        unstore = [a for a in tbdr_issues if a.get("issue") == "unnecessary_store"]
+        if tbdr_wasted > 0.5:
+            detail_parts = []
+            if unload:
+                detail_parts.append(f"{len(unload)} unnecessary load op(s) reading from DRAM with no prior writer")
+            if unstore:
+                detail_parts.append(f"{len(unstore)} unnecessary store op(s) writing transient RTs to DRAM")
+            suggestions.append({
+                "severity": "warning" if tbdr_wasted > 2.0 else "info",
+                "title": f"TBDR tile bandwidth waste: {tbdr_wasted:.2f} MB/frame",
+                "detail": (
+                    ". ".join(detail_parts) + ". "
+                    "Use DontCare loadOp/storeOp for transient attachments to keep data in tile memory."
+                ),
+                "category": "Bandwidth",
+            })
 
     # 7. Total bandwidth
     total_mb = analysis["bandwidth"].get("total_mb", 0)
@@ -1562,7 +1592,83 @@ def render_html(analysis: dict, capture_name: str, assets_rel: str = "../html") 
     else:
         mipmap_html = '<p class="text-muted">No mipmap view-level waste detected (or binding_views.json not available — re-run collect.py).</p>'
 
-    # Section 10: Suggestions
+    # Section 10: TBDR Efficiency
+    tbdr_data = analysis.get("tbdr") or {}
+    if not tbdr_data.get("available"):
+        tbdr_reason = tbdr_data.get("reason", "TBDR data unavailable")
+        tbdr_html = f'<p class="text-muted">{_esc(tbdr_reason)}</p>'
+    else:
+        tbdr_issues = tbdr_data.get("issues") or []
+        tbdr_all = tbdr_data.get("per_attachment") or []
+        tbdr_wasted = tbdr_data.get("total_wasted_mb", 0.0)
+        tbdr_worst = tbdr_data.get("worst_pass", "")
+
+        tbdr_table_rows = []
+        for a in tbdr_all:
+            issue = a.get("issue")
+            load_op = a.get("load_op", "")
+            store_op = a.get("store_op", "")
+            if issue == "unnecessary_load":
+                load_color = "#ef4444"
+                store_color = "inherit"
+            elif issue == "unnecessary_store":
+                load_color = "inherit"
+                store_color = "#f97316"
+            else:
+                load_color = store_color = "inherit"
+            issue_badge = (
+                f'<span style="color:#ef4444;font-weight:600">unnecessary_load</span>'
+                if issue == "unnecessary_load" else
+                f'<span style="color:#f97316;font-weight:600">unnecessary_store</span>'
+                if issue == "unnecessary_store" else ""
+            )
+            tbdr_table_rows.append(
+                f'<tr>'
+                f'<td>{_esc(a.get("pass", ""))}</td>'
+                f'<td>{_esc(a.get("attachment", ""))}</td>'
+                f'<td>{_esc(a.get("attachment_type", ""))}</td>'
+                f'<td>{_esc(a.get("format", ""))}</td>'
+                f'<td class="num">{_esc(a.get("rt_size", ""))}</td>'
+                f'<td class="num">{a.get("tile_mb", 0.0):.3f}</td>'
+                f'<td style="color:{load_color}">{_esc(load_op)}</td>'
+                f'<td style="color:{store_color}">{_esc(store_op)}</td>'
+                f'<td>{issue_badge}</td>'
+                f'<td style="font-size:11px">{_esc(a.get("recommendation", ""))}</td>'
+                f'</tr>'
+            )
+
+        tbdr_html = f"""
+    <div class="mini-cards">
+      <div class="mini-card">
+        <div class="mini-label">Total Wasted BW</div>
+        <div class="mini-value">{tbdr_wasted:.2f} MB</div>
+      </div>
+      <div class="mini-card">
+        <div class="mini-label">Issues Found</div>
+        <div class="mini-value">{len(tbdr_issues)}</div>
+      </div>
+      <div class="mini-card">
+        <div class="mini-label">Worst Pass</div>
+        <div class="mini-value small">{_esc(tbdr_worst)}</div>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text-muted);margin:4px 0 12px">
+      Tile bandwidth cost per full RT load or store.
+      <span style="color:#ef4444">Red load</span> = loaded from DRAM with no prior writer.
+      <span style="color:#f97316">Orange store</span> = stored to DRAM with no subsequent reader (transient RT).
+    </p>
+    <div class="table-wrap">
+    <table class="data-table sortable">
+      <thead><tr>
+        <th>Pass</th><th>Attachment</th><th>Type</th><th>Format</th><th>RT Size</th>
+        <th>Tile MB</th><th>Load Op</th><th>Store Op</th><th>Issue</th><th>Recommendation</th>
+      </tr></thead>
+      <tbody>{"".join(tbdr_table_rows)}</tbody>
+    </table>
+    </div>
+    """
+
+    # Section 11: Suggestions
     suggestion_cards = []
     for s in suggestions:
         suggestion_cards.append(
@@ -2227,9 +2333,18 @@ h4 {{
     <div class="section-body">{mipmap_html}</div>
   </div>
 
+  <div class="section" id="sec-tbdr">
+    <div class="section-header" onclick="toggleSection('sec-tbdr')">
+      <span class="section-num">10</span>
+      <h2>TBDR Tile Efficiency</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="section-body">{tbdr_html}</div>
+  </div>
+
   <div class="section" id="sec-suggestions">
     <div class="section-header" onclick="toggleSection('sec-suggestions')">
-      <span class="section-num">10</span>
+      <span class="section-num">11</span>
       <h2>Optimization Suggestions</h2>
       <span class="toggle">&#9660;</span>
     </div>
@@ -2312,6 +2427,7 @@ def main():
         "memory": analyze_memory(data),
         "overdraw": analyze_overdraw(data),
         "mipmap_usage": analyze_mipmap_usage(data),
+        "tbdr": analyze_tbdr(data),
     }
     analysis["suggestions"] = generate_suggestions(analysis, data)
 

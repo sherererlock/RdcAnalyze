@@ -251,6 +251,31 @@ def _build_mipmap_usage(computed: dict) -> tuple[list[str], list[list]]:
     return headers, rows
 
 
+def _build_tbdr(computed: dict) -> tuple[list[str], list[list]]:
+    tbdr = (computed or {}).get("tbdr") or {}
+    if not tbdr.get("available"):
+        return [], []
+    issues = tbdr.get("issues") or []
+    if not issues:
+        return [], []
+    headers = ["pass", "attachment", "type", "format", "rt_size", "tile_mb", "load_op", "store_op", "issue", "recommendation"]
+    rows = []
+    for a in issues:
+        rows.append([
+            a.get("pass", ""),
+            a.get("attachment", ""),
+            a.get("attachment_type", ""),
+            a.get("format", ""),
+            a.get("rt_size", ""),
+            a.get("tile_mb", 0.0),
+            a.get("load_op", ""),
+            a.get("store_op", ""),
+            a.get("issue", ""),
+            a.get("recommendation", ""),
+        ])
+    return headers, rows
+
+
 def _build_alerts(computed: dict) -> tuple[list[str], list[list]]:
     alerts = computed.get("alerts") or []
     if not alerts:
@@ -557,6 +582,10 @@ def export_tsv(
     muh, mur = _build_mipmap_usage(computed or {})
     if muh:
         tables["mipmap_usage"] = (muh, mur)
+
+    tbh, tbr = _build_tbdr(computed or {})
+    if tbh:
+        tables["tbdr_efficiency"] = (tbh, tbr)
 
     counters_by_eid = _build_counters_by_eid(summary)
     sh, sr, sumh, sumr = _build_pipeline_stages(summary, pass_details, counters_by_eid)
