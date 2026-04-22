@@ -292,13 +292,14 @@ def analyze_hotspots(data: dict) -> dict:
 
 
 def analyze_bandwidth(data: dict) -> dict:
-    pass_details = data.get("pass_details") or []
+    subpasses = data.get("subpasses") or []
+    active_passes = subpasses if subpasses else (data.get("pass_details") or [])
     passes_bw = []
     total_bw = 0.0
     bloom_bw = 0.0
 
-    for p in pass_details:
-        name = p.get("name", "")
+    for p in active_passes:
+        name = p.get("display_name") or p.get("name", "")
         # Each pass: load (read) all targets + store (write) all targets
         # Without load/store ops, assume worst case: load + store for each target
         read_bytes = 0.0
@@ -331,7 +332,7 @@ def analyze_bandwidth(data: dict) -> dict:
         "passes": passes_bw,
         "total_mb": round(total_bw / (1024 * 1024), 2),
         "bloom_mb": round(bloom_bw / (1024 * 1024), 2),
-        "bloom_passes": sum(1 for p in pass_details if "bloom" in p.get("name", "").lower()),
+        "bloom_passes": sum(1 for p in active_passes if "bloom" in (p.get("display_name") or p.get("name", "")).lower()),
     }
 
 
