@@ -219,38 +219,75 @@ pass    eid_range    rt_size    rt_pixels    ps_invocations    overdraw    sever
 
 ### C3. **Mipmap 使用率检查**（中）
 
-`resource_details.json` 已有纹理的 `mips`，但未检查实际采样的 LOD 分布。可在 shader 反汇编中扫描 `ImageSampleExplicitLod` / `ImageSampleImplicitLod` 与基本 mip 计算，输出 "纹理 X 仅用 LOD 0–1，可减小 mipmap 数" 之类建议。
+`resource_details.json` 已有纹理的 `mips` 总数，但未检查实际 view 覆盖的 mip 范围。新增一次采集步骤，收集每个 draw 的 descriptor view 信息，输出"纹理 X 的 view 仅覆盖 mip 0–1，剩余 N 层浪费显存"之类建议。
+
+#### Spike 结果（2026-04-22）
+
+- `rdc-cli bindings --json` 输出固定为 `{eid, stage, kind, set, slot, name}`，**不暴露 view / mip 信息**，无法通过扩展 bindings 命令解决。
+- `rdc-cli script` 在 daemon 内可调用 RenderDoc Python API `controller.GetDescriptors(descriptorSetResourceId, [DescriptorRange])` 拿到完整 `Descriptor` 对象，字段含：
+  ```
+  firstMip    ← view 起始 mip 层
+  numMips     ← view 覆盖的 mip 层数（上界，非实际采样层）
+  resource    ← ResourceId，对应 resource_details 中的纹理 ID
+  view        ← view ResourceId
+  ```
+  实测（ls.rdc EID 214，set 2）：`firstMip=0, numMips=9, resource=9631199`，该纹理总 mips=9 → 全量覆盖，无浪费。
+
+**精度说明**：`numMips` 是 view 可见范围，硬件 LOD 选择在 `[firstMip, firstMip+numMips)` 内自动决定，无法从静态 view 得知具体采样了哪层。因此本方案检测的是 **view 级别的 mip 浪费**（view 未覆盖的层必然不被采样），而非采样级别的精确 LOD 分布。
 
 #### 实施细节
 
-**前置（必做，是 C3 的硬依赖）**：当前 `bindings.json` 每个 binding 仅有 `{eid, stage, kind, set, slot, name}`，**完全无 sampler / view / mip 信息**。需先扩展 `collect.py` Step 4 的 bindings 收集：
+**Step 1：新增采集脚本 `Scripts/rdc/collect_mip_views.py`**（或内联进 `collect.py` 作为新步骤），通过 `rdc-cli script` 一次性扫描所有 draw 的 descriptor set，输出 `json/binding_views.json`：
 
+```python
+# 脚本在 daemon 内执行，rd / controller 已注入
+result = {}  # {str(eid): [{set, bind, resource_id, first_mip, num_mips}]}
+for action in controller.GetRootActions():
+    for draw in _iter_draws(action):
+        eid = draw.eventId
+        controller.SetFrameEvent(eid, False)
+        state = controller.GetVulkanPipelineState()
+        entries = []
+        for set_idx, ds in enumerate(state.graphics.descriptorSets):
+            dr = rd.DescriptorRange()
+            dr.offset = 0
+            dr.count = 64  # 每组最多取 64 个 descriptor
+            descs = controller.GetDescriptors(ds.descriptorSetResourceId, [dr])
+            for d in descs:
+                rid = int(str(d.resource).split("::")[-1])
+                if rid == 0:
+                    continue
+                entries.append({
+                    "set": set_idx, "bind": int(d.byteOffset),
+                    "resource_id": rid,
+                    "first_mip": d.firstMip, "num_mips": d.numMips,
+                })
+        if entries:
+            result[str(eid)] = entries
+```
+
+**输出 `json/binding_views.json` schema**：
 ```json
 {
-  "eid": 5195, "stage": "ps", "kind": "ro", "set": 2, "slot": 0, "name": "res11",
-  "view_resource_id": 110697623,   // 新增
-  "view_base_mip": 0,              // 新增
-  "view_mip_count": 5,             // 新增
-  "sampler_resource_id": 110697630 // 新增（如 rdc-cli 暴露）
+  "214": [
+    {"set": 2, "bind": 0, "resource_id": 9631199, "first_mip": 0, "num_mips": 9}
+  ]
 }
 ```
 
-> **Spike 验证**：需先确认 rdc-cli `bindings --json` 是否暴露 view/sampler 信息。若不暴露，降级方案：扫描 shader disasm 中 `ImageSampleExplicitLod` 出现的纹理名，只标记"该纹理有显式 LOD，mip 可能冗余"（精度低但零 collect 改动）。
-
-**Step 1：新函数 `analyze_mipmap_usage(bindings, resources)`**，放 `computed.py` 或新模块 `mipmap_usage.py`：
+**Step 2：新函数 `compute_mipmap_usage(binding_views, resource_details)`**，放 `computed.py`：
 
 ```python
-def analyze_mipmap_usage(bindings: dict, resources: dict) -> dict:
+def compute_mipmap_usage(binding_views: dict, resource_details: dict) -> dict:
     """
     Returns:
       {
         "per_texture": [
           {"resource_id": int, "name": str, "total_mips": int,
-           "used_mips": [0, 1],
-           "usage_count": {"0": 50, "1": 12},
-           "wasted_mips": [2, 3, 4],
+           "viewed_mip_range": [first, last],   # 所有 binding 中 view 覆盖的最大范围
+           "unviewed_mips": [k, ...],            # total_mips 中从未被任何 view 覆盖的层
            "wasted_bytes": int,
-           "recommendation": "Reduce mips from 5 to 2"}
+           "recommendation": "Reduce mips from 9 to 5"}
         ],
         "total_wasted_mb": float
       }
@@ -258,16 +295,30 @@ def analyze_mipmap_usage(bindings: dict, resources: dict) -> dict:
 ```
 
 **算法**：
-1. 遍历 `bindings` 中每个 ps `ro` binding，取 `view_base_mip`，归档到 `texture_usage[res_id][mip] += 1`
-2. 对每个采样过的纹理，查 `resource_details[res_id]["mips"]` 得总 mip 数，找 `unused_mips = set(0..total-1) - used_mips`
-3. `wasted_bytes ≈ byte_size × Σ(0.25^k for k in unused) / Σ(0.25^k for k in 0..total-1)`（mip 金字塔几何级数估算）
+1. 遍历 `binding_views`，按 `resource_id` 累计各 view 的 `[first_mip, first_mip + num_mips)` 集合
+2. 对每张 mips > 1 的纹理，`unviewed = set(0..total_mips-1) - union(viewed_ranges)`
+3. `wasted_bytes ≈ byte_size × Σ(0.25^k for k in unviewed) / Σ(0.25^k for k in 0..total-1)`（mip 金字塔几何级数，精确比例）
+4. 仅输出 `unviewed_mips` 非空且 `wasted_bytes > 0` 的纹理
 
-**Step 2：TSV**，新增 `mipmap_usage.tsv`：
+**Step 3：TSV**，在 `tsv_export.py` 新增 `_build_mipmap_usage(computed)` → `mipmap_usage.tsv`：
 ```
-resource    total_mips    used_mips    wasted_mb    recommendation
+resource    total_mips    viewed_range    unviewed_mips    wasted_mb    recommendation
 ```
 
-**关键文件**：`Scripts/rdc/collect.py`（bindings step，需 spike）；`Scripts/rdc/computed.py`；`Scripts/rdc/tsv_export.py`；`Scripts/rdc/analyze.py`
+**Step 4：`compute_analysis()` 集成**（`computed.py:compute_analysis()`）：
+```python
+binding_views = load_json(json_dir / "binding_views.json") or {}
+result["mipmap_usage"] = compute_mipmap_usage(binding_views, resource_details)
+```
+
+**Step 5：HTML**，在 `analyze.py` 新增 `analyze_mipmap_usage(data)` section，表格列出浪费超过 1 MB 的纹理，加入 Optimization Suggestions。
+
+**关键文件**：
+- `Scripts/rdc/collect.py`（新 Step：调用 `rdc-cli script` 收集 binding_views）
+- `Scripts/rdc/collect_mip_views.py`（新文件：在 daemon 内执行的采集脚本）
+- `Scripts/rdc/computed.py`（新增 `compute_mipmap_usage()`）
+- `Scripts/rdc/tsv_export.py`（新增 `mipmap_usage.tsv`）
+- `Scripts/rdc/analyze.py`（新增 HTML section）
 
 ---
 
@@ -538,7 +589,8 @@ overdraw_per_pass.MainColor:
   - `Scripts/rdc/render_graph.py:410` `_build_dependency_edges()` —— C5/C6 复用
   - `Scripts/rdc/compare.py`（新文件）—— C4：多 capture diff
   - `Scripts/rdc/assert.py`（新文件）—— C8：CI gate
-  - `Scripts/rdc/collect.py` —— C3：bindings step 扩 view/mip 字段（需先 spike）；C7：_parse_vbuffer 保留列类型
+  - `Scripts/rdc/collect.py` —— C3：新增 rdc-cli script 步骤采集 binding_views.json；C7：_parse_vbuffer 保留列类型
+  - `Scripts/rdc/collect_mip_views.py`（新文件）—— C3：daemon 内执行脚本，调用 GetDescriptors 收集 view/mip 范围
   - `Scripts/rdc/export_assets.py:155+/192` —— C7：_export_one_mesh 扩字段
 
 ## F. 验证方式
